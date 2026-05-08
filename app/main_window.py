@@ -919,7 +919,23 @@ class MainWindow(QMainWindow):
         QMessageBox.critical(self, "Lỗi Lồng Tiếng", msg)
 
     def _preview_voice(self):
-        """Preview voice with a sample text — runs in background thread."""
+        """Preview voice with a sample text — runs in background thread.
+
+        The preview pipeline only knows how to drive Edge TTS today, so
+        we gate non-Edge providers explicitly. Without this gate the
+        ``voice_type`` lookup silently falls back to the first
+        Vietnamese Edge voice (``VOICE_CONFIGS_EDGE_VI[0]``), which
+        misleads users on Google TTS / ElevenLabs into thinking those
+        provider voices have been previewed.
+        """
+        provider = self.config_section.combo_voice_provider.currentText()
+        if 'Edge' not in provider:
+            QMessageBox.information(
+                self, "Nghe Thử Giọng",
+                "Tính năng nghe thử hiện chỉ hỗ trợ Edge TTS. "
+                "Hãy chuyển provider sang Edge để nghe thử, hoặc bấm "
+                "▶ Tạo File Lồng Tiếng để nghe trực tiếp file kết quả.")
+            return
         try:
             import edge_tts  # noqa: F401
         except ImportError:
@@ -1347,6 +1363,17 @@ class MainWindow(QMainWindow):
         output_dir = (os.path.dirname(job.output_path)
                        if job.output_path else self._resolve_output_dir())
         os.makedirs(output_dir, exist_ok=True)
+
+        # Mirror ``_enqueue_active_render``: flip the render stage to
+        # RUNNING and persist before launching the worker so the queue
+        # UI / crash-recovery agree with the live state. Without this,
+        # the dialog stays on "Đang chờ" while the retry runs and a
+        # crash mid-retry would leave the row marked PENDING forever.
+        job.set_status(Stage.RENDER, StageStatus.RUNNING)
+        try:
+            self.render_queue.update(job)
+        except Exception as exc:  # noqa: BLE001
+            logger.warning("Failed to update queue on retry: %s", exc)
 
         self._active_job = job
         from app.threads.video_creator import VideoCreatorThread

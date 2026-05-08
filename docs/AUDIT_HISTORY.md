@@ -4,6 +4,82 @@ A running log of code-audit findings and the PRs that addressed them. Newest
 entries on top. Use this as a starting point for the next audit instead of
 re-reading the whole codebase from scratch.
 
+## Round 4 — devin/1778237716-audit-round4
+
+Branch: `devin/1778237716-audit-round4`. Two P1 + two P2 fixes surfaced while
+re-reading the persistence + translation + voice paths after PR #9.
+
+### P1-A — `_retry_queued_job` didn't mark the render as RUNNING
+
+`RenderQueueDialog._retry_selected` only flips the persisted status back to
+`PENDING`. The launcher (`MainWindow._retry_queued_job`) then started a fresh
+`VideoCreatorThread` *without* persisting a transition to `RUNNING` — only the
+non-retry path (`_enqueue_active_render`) did that. Two consequences:
+
+1. The queue dialog kept showing "Đang chờ" while the retry was actively
+   rendering, so the user could enqueue / retry the same job twice.
+2. If the app crashed mid-retry, `_maybe_resume_pending_jobs` had no way to
+   tell the row apart from a brand-new pending job — it stayed at `PENDING`
+   forever instead of being recovered alongside other `RUNNING` rows.
+
+**Fix**: in `_retry_queued_job`, call `job.set_status(Stage.RENDER, RUNNING)`
+and `self.render_queue.update(job)` before launching the worker, mirroring
+`_enqueue_active_render`. Failures to persist are logged but don't abort the
+retry (the in-memory job state still drives the live render).
+
+File: `app/main_window.py`.
+
+### P1-B — `subtitles_to_srt` raised `KeyError` on `'timeline'`
+
+`utils/srt_parser.subtitles_to_srt` indexed `entry['timeline']` directly. That
+key is written by `parse_srt`, but other producers don't always set it:
+
+* `project_file._subtitles_to_srt` already had a defensive fallback (`start` /
+  `end` → reconstructed timeline → `'00:00:00,000'`), but the public helper in
+  `srt_parser` did not.
+* Any future caller that builds entries by hand (or any rpp written by a
+  third-party tool that strips the field) would crash on the first save.
+
+**Fix**: mirror the project-file fallback — prefer `entry['timeline']` when
+present, otherwise rebuild from `start` / `end`, defaulting to
+`'00:00:00,000'` so saving never KeyErrors. Also added a docstring noting the
+canonical timeline shape.
+
+File: `app/utils/srt_parser.py`.
+
+### P2-A — LLM batch translation rotated keys via `list.index`
+
+`TranslateThread._run_batch_llm._run_one` looked up the current batch's index
+via `batches.index(batch)` for Gemini key rotation. Two problems:
+
+1. `list.index` is O(n) — repeated on every batch this is O(n²) work for a
+   purely cosmetic lookup.
+2. `list.index` returns the *first* match by equality. If two batches happen
+   to contain identical entries (duplicate dialogue, repeated jingles), they
+   collapse onto the same API key and lose rotation entirely.
+
+**Fix**: pre-compute the batch index via `enumerate(batches)` when submitting
+to the executor and pass it into `_run_one` as an explicit argument. Also
+hoisted `key_count` outside the closure so we don't re-take `len()` per call.
+
+File: `app/threads/translate_thread.py`.
+
+### P2-B — `_preview_voice` silently ignored the selected provider
+
+The preview pipeline only knows how to drive Edge TTS, but `_preview_voice`
+unconditionally consulted `VOICE_CONFIGS_EDGE_VI`. When the user picked
+Google TTS or ElevenLabs, the `voice_type` lookup missed (different label
+set) and fell through to `VOICE_CONFIGS_EDGE_VI[0]` — i.e. the first
+Vietnamese Edge voice. Users would hear a Vietnamese Edge sample and assume
+their actual provider produced it.
+
+**Fix**: gate `_preview_voice` on the active provider (`combo_voice_provider`).
+Non-Edge providers now show a clear `QMessageBox.information` explaining the
+limitation and pointing at the full voiceover button instead. Edge previews
+are unchanged.
+
+File: `app/main_window.py`.
+
 ## Round 3 — PR #9 (merged)
 
 Branch: `devin/1778234515-deep-audit-round3`. Four narrowly scoped P1 fixes,
@@ -93,7 +169,7 @@ respects the `noqa: F401` comment).
 | File                  | Line | Why kept                                                   |
 |-----------------------|-----:|------------------------------------------------------------|
 | `app/dialogs.py`      | 380  | `import yt_dlp` after pip-install verifies the package.    |
-| `app/main_window.py`  | 924  | `import edge_tts` (`# noqa: F401`) verifies availability.  |
+| `app/main_window.py`  | 940  | `import edge_tts` (`# noqa: F401`) verifies availability.  |
 
 If pyflakes ever gains `noqa` support these will disappear automatically;
 adding our own ignore directive isn't worth the diff right now.
