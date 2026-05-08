@@ -1100,7 +1100,21 @@ class MainWindow(QMainWindow):
         self._run_next_batch_item()
 
     def _collect_overlay_data(self):
-        """Collect overlay data from video player scene."""
+        """Collect overlay data from video player scene.
+
+        Overlay positions live in *scene-space* and the scene rect is
+        bound to ``video_item.boundingRect()``. The renderer rescales
+        them with ``preview_width`` / ``preview_height`` as the
+        reference size — so those numbers MUST be the video item's
+        size, NOT the view's. Reading ``self.video_player.view.size()``
+        included letterbox padding around the video item, which made
+        overlays drift toward the top-left corner whenever the player
+        had black bars (vertical clip in a 16:9 frame, horizontal clip
+        in a 9:16 frame).
+
+        This mirrors :meth:`VideoPlayerSection.get_all_overlays`, which
+        was fixed for the same reason in Round 5 (P2-B).
+        """
         from app.overlays import DraggableTextItem, DraggableBlurRegion
         texts = []
         blurs = []
@@ -1109,12 +1123,13 @@ class MainWindow(QMainWindow):
                 texts.append(item.get_data())
             elif isinstance(item, DraggableBlurRegion):
                 blurs.append(item.get_region_data())
+        item_size = self.video_player.video_item.size()
         return {
             'texts': texts,
             'blurs': blurs,
             'logo_path': self.config_section.logo_path.text(),
-            'preview_width': max(self.video_player.view.width(), 1),
-            'preview_height': max(self.video_player.view.height(), 1),
+            'preview_width': max(int(item_size.width()), 1),
+            'preview_height': max(int(item_size.height()), 1),
         }
 
     # ── P3-17 overlay layout presets ─────────────────────────

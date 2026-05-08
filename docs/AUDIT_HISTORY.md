@@ -6,9 +6,11 @@ re-reading the whole codebase from scratch.
 
 ## Round 5 — devin/1778238023-audit-round5
 
-Branch: `devin/1778238023-audit-round5`. Two P2 + two P3 fixes surfaced while
-re-reading the rendering / overlay / TTS paths after PR #11. The first two
-both produce visibly wrong output and the last two are silent quality issues.
+Branch: `devin/1778238023-audit-round5`. Three P2 + two P3 fixes surfaced
+while re-reading the rendering / overlay / TTS paths after PR #11. The
+first three all produce visibly wrong output, the last two are silent
+quality issues. P2-C was found in a follow-up bytecode trace pass after the
+initial four fixes had been pushed (see `docs/WORKFLOW_VALIDATION.md`).
 
 ### P2-A — `_escape_drawtext_text` doubled every backslash it inserted
 
@@ -56,6 +58,39 @@ avoid `ZeroDivisionError` if a render is somehow triggered before
 non-zero, so this is purely defensive).
 
 File: `app/video_player.py`.
+
+### P2-C — `_collect_overlay_data` had the same bug as `get_all_overlays`
+
+There are *two* parallel collectors for the overlay scene: the one inside
+`VideoPlayerSection.get_all_overlays` (which P2-B fixed) and the one in
+`MainWindow._collect_overlay_data`. The two methods produce structurally
+identical dicts, but the latter had been left untouched and was still
+reporting `preview_width = self.video_player.view.width()` /
+`preview_height = self.video_player.view.height()`. Surfaced by the
+bytecode trace in `docs/WORKFLOW_VALIDATION.md` (§11b).
+
+This matters because **both** collectors flow into the renderer:
+
+* `VideoPlayerSection.get_all_overlays` is called by the snowflake
+  preview path.
+* `MainWindow._collect_overlay_data` is called by `_start_create_video`
+  (single render), `_start_batch_render` / `_run_next_batch_item` (batch
+  render), `_retry_queued_job` (queue retry), and the
+  `_save_overlay_preset` / `_load_overlay_preset` round-trip.
+
+So the *primary* render path was still using the wrong denominator after
+P2-B — the bug just moved one frame up the call stack. With the snowflake
+preview fixed but the actual render still wrong, an audit run that only
+checked snowflakes would have called this "fixed" while every real render
+the user produced still drifted.
+
+**Fix**: replicate the P2-B fix verbatim — read
+`self.video_player.video_item.size()` and bound it with `max(..., 1)`. The
+docstring now spells out the scene-space invariant so the next person who
+edits the method doesn't reintroduce the same bug. The two collectors now
+agree byte-for-byte on what `preview_width` / `preview_height` mean.
+
+File: `app/main_window.py`.
 
 ### P3-A — ChatGPT batch path ignored every API key after the first
 
