@@ -10,10 +10,10 @@ from pathlib import Path
 from PyQt6.QtWidgets import (
     QMainWindow, QWidget, QVBoxLayout, QHBoxLayout, QLabel, QPushButton,
     QLineEdit, QSplitter, QStackedWidget, QFileDialog, QMessageBox,
-    QApplication, QSizePolicy, QTableWidgetItem, QDialog, QProgressBar
+    QDialog,
 )
-from PyQt6.QtCore import Qt, QSize, QTimer, QUrl, QThread, pyqtSignal
-from PyQt6.QtGui import QIcon, QAction, QKeySequence, QShortcut
+from PyQt6.QtCore import Qt, QTimer, QUrl, QThread, pyqtSignal
+from PyQt6.QtGui import QAction, QKeySequence, QShortcut
 
 from app.video_player import VideoPlayerSection
 from app.config_section import ConfigSection
@@ -29,7 +29,6 @@ from app.render_queue_dialog import RenderQueueDialog
 from app.utils.config import (
     BASE_DIR, load_api_config,
     load_user_preferences, save_user_preferences,
-    LANGUAGES, TRANSLATION_MODELS
 )
 from app.utils.logger import get_logger
 from app.utils.srt_parser import parse_srt

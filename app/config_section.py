@@ -4,13 +4,12 @@ Config Section — 8-tab configuration panel
 from PyQt6.QtWidgets import (
     QWidget, QVBoxLayout, QHBoxLayout, QLabel, QPushButton, QLineEdit,
     QComboBox, QTabWidget, QSlider, QRadioButton, QButtonGroup,
-    QCheckBox, QSpinBox, QDoubleSpinBox, QFileDialog, QColorDialog,
-    QScrollArea, QSizePolicy, QGroupBox
+    QCheckBox, QSpinBox, QFileDialog, QColorDialog,
 )
 from PyQt6.QtCore import Qt, QTimer
 
 from app.utils.config import (
-    LANGUAGES, TRANSLATION_MODELS, DEFAULT_STYLES, VOICE_CONFIGS_EDGE_VI,
+    LANGUAGES, TRANSLATION_MODELS, VOICE_CONFIGS_EDGE_VI,
     load_styles_config, load_user_preferences, save_user_preferences
 )
 from app.utils.logger import get_logger

@@ -231,6 +231,11 @@ class VideoCreatorThread(QThread):
         bg_enabled = config.get('text_subtitle_bg_enabled', False)
         bg_opacity = config.get('text_subtitle_bg_opacity', 80)
         border_style = 3 if bg_enabled else 1  # 3 = opaque box
+        # Compute ASS BackColour alpha from the UI opacity slider (0-100).
+        bg_alpha = int((100 - bg_opacity) * 255 / 100)  # 0=opaque, 255=transparent
+        bg_color_hex = config.get('text_subtitle_bg_color', '#000000').lstrip('#')
+        bg_r, bg_g, bg_b = bg_color_hex[:2], bg_color_hex[2:4], bg_color_hex[4:6]
+        back_colour = f"&H{bg_alpha:02X}{bg_b}{bg_g}{bg_r}"
 
         y_percent = config.get('text_subtitle_y', 90)
         margin_v = max(10, int((100 - y_percent) * 10.8))
@@ -244,7 +249,7 @@ PlayResY: 1080
 
 [V4+ Styles]
 Format: Name, Fontname, Fontsize, PrimaryColour, SecondaryColour, OutlineColour, BackColour, Bold, Italic, Underline, StrikeOut, ScaleX, ScaleY, Spacing, Angle, BorderStyle, Outline, Shadow, Alignment, MarginL, MarginR, MarginV, Encoding
-Style: Default,Arial,{font_size},{ass_color},&H000000FF,&H00000000,&H80000000,-1,0,0,0,100,100,0,0,{border_style},2,0,2,10,10,{margin_v},1
+Style: Default,Arial,{font_size},{ass_color},&H000000FF,&H00000000,{back_colour},-1,0,0,0,100,100,0,0,{border_style},2,0,2,10,10,{margin_v},1
 
 [Events]
 Format: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text

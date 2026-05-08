@@ -6,10 +6,10 @@ QMediaPlayer-based video preview with overlay support.
 
 from PyQt6.QtWidgets import (
     QWidget, QVBoxLayout, QHBoxLayout, QLabel, QPushButton,
-    QSlider, QGraphicsView, QGraphicsScene, QSizePolicy, QStackedWidget
+    QSlider, QGraphicsView, QGraphicsScene, QSizePolicy,
 )
-from PyQt6.QtCore import Qt, QSize, QSizeF, QUrl, QRectF, QTimer
-from PyQt6.QtGui import QFont, QPixmap, QIcon, QPainter, QColor, QBrush, QPen
+from PyQt6.QtCore import Qt, QSizeF, QUrl, QTimer
+from PyQt6.QtGui import QPainter
 from PyQt6.QtMultimedia import QMediaPlayer, QAudioOutput
 from PyQt6.QtMultimediaWidgets import QGraphicsVideoItem
 

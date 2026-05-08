@@ -7,7 +7,7 @@ import sys
 from PyQt6.QtWidgets import (
     QDialog, QVBoxLayout, QHBoxLayout, QLabel, QPushButton,
     QLineEdit, QComboBox, QTextEdit, QListWidget, QMessageBox,
-    QFileDialog, QProgressBar
+    QFileDialog,
 )
 from PyQt6.QtCore import QThread, pyqtSignal
 from app.utils.config import (

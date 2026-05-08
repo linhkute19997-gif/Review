@@ -7,7 +7,7 @@ Render status display with progress, GPU info, timer, and batch table.
 import os
 
 from PyQt6.QtWidgets import (
-    QWidget, QVBoxLayout, QHBoxLayout, QLabel, QPushButton,
+    QWidget, QVBoxLayout, QHBoxLayout, QLabel,
     QProgressBar, QTableWidget, QTableWidgetItem, QHeaderView,
 )
 from PyQt6.QtCore import Qt, QTimer
