@@ -546,6 +546,51 @@ class ConfigSection(QWidget):
 
     def set_video_player(self, vp):
         self.video_player = vp
+        # Wire WYSIWYG preview now that we have a player to drive.
+        # All subtitle / border / opacity widgets push their state through
+        # ``_apply_live_preview`` so the user sees the same look in the
+        # video panel that the FFmpeg render will produce.
+        self._wire_live_preview()
+        self._apply_live_preview()
+
+    def _wire_live_preview(self):
+        """Connect every preview-affecting widget to ``_apply_live_preview``."""
+        widgets_state = [
+            self.chk_subtitle_enabled.toggled,
+            self.subtitle_opacity.valueChanged,
+            self.chk_top_border.toggled,
+            self.top_height.valueChanged,
+            self.top_text.textChanged,
+            self.chk_bot_border.toggled,
+            self.bot_height.valueChanged,
+            self.bot_text.textChanged,
+        ]
+        for sig in widgets_state:
+            sig.connect(lambda *_: self._apply_live_preview())
+
+    def _apply_live_preview(self):
+        """Push current subtitle/border config into the attached video player."""
+        if not self.video_player:
+            return
+        try:
+            self.video_player.show_subtitle_bar(
+                self.chk_subtitle_enabled.isChecked())
+            self.video_player.update_subtitle_opacity(
+                self.subtitle_opacity.value())
+            self.video_player.set_top_border(
+                self.chk_top_border.isChecked(),
+                color=self._get_button_color(self.btn_top_color),
+                height=self.top_height.value(),
+                text=self.top_text.text(),
+                text_color=self._get_button_color(self.btn_top_text_color))
+            self.video_player.set_bottom_border(
+                self.chk_bot_border.isChecked(),
+                color=self._get_button_color(self.btn_bot_color),
+                height=self.bot_height.value(),
+                text=self.bot_text.text(),
+                text_color=self._get_button_color(self.btn_bot_text_color))
+        except Exception as exc:  # noqa: BLE001
+            print(f"[DEBUG] live preview update failed: {exc}")
 
     def get_config(self) -> dict:
         audio_mode = self.audio_group.checkedId()

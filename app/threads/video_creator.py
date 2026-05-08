@@ -4,7 +4,7 @@ Video Creator Thread — FFmpeg rendering pipeline
 import os
 import subprocess
 import traceback
-from pathlib import Path
+import threading
 from PyQt6.QtCore import QThread, pyqtSignal
 from app.utils.config import FFMPEG_PATH, FFPROBE_PATH
 
@@ -53,6 +53,92 @@ class VideoCreatorThread(QThread):
             return int(lines[0]), int(lines[1])
         except Exception:
             return 1920, 1080
+
+    def _probe_video_duration_us(self, video_path):
+        """Return container duration in microseconds (or 0 if probe fails)."""
+        ffprobe = FFPROBE_PATH if os.path.exists(FFPROBE_PATH) else 'ffprobe'
+        try:
+            cmd = [ffprobe, '-v', 'error', '-show_entries',
+                   'format=duration', '-of',
+                   'default=noprint_wrappers=1:nokey=1', str(video_path)]
+            result = subprocess.run(
+                cmd, capture_output=True, text=True,
+                creationflags=getattr(subprocess, 'CREATE_NO_WINDOW', 0))
+            seconds = float(result.stdout.strip() or 0)
+            return int(seconds * 1_000_000)
+        except Exception:
+            return 0
+
+    def _run_ffmpeg_with_progress(self, cmd, total_us, progress_lo=20,
+                                   progress_hi=90, timeout=1800):
+        """Run an FFmpeg command and emit real progress percentages.
+
+        FFmpeg's ``-progress pipe:1`` emits ``key=value`` lines on stdout
+        every second; ``out_time_us`` lets us compute real %
+        completion. We map [0..total_us] linearly into
+        [progress_lo..progress_hi] so this slot integrates with the
+        existing 0/5/20/90/100 milestones used elsewhere in run().
+
+        Returns ``(returncode, stderr_bytes)``.
+        """
+        # Inject -progress + -nostats right after the program name.
+        cmd = list(cmd)
+        # Insert just before the input list (after global flags) — placing
+        # it at index 1 (right after the binary path) is safe.
+        cmd[1:1] = ['-progress', 'pipe:1', '-nostats']
+
+        proc = subprocess.Popen(
+            cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+            creationflags=getattr(subprocess, 'CREATE_NO_WINDOW', 0))
+
+        stderr_chunks = []
+
+        def drain_stderr():
+            try:
+                for chunk in iter(lambda: proc.stderr.read(4096), b''):
+                    if not chunk:
+                        break
+                    stderr_chunks.append(chunk)
+            except Exception:
+                pass
+
+        t = threading.Thread(target=drain_stderr, daemon=True)
+        t.start()
+
+        last_pct = progress_lo
+        try:
+            for raw in iter(proc.stdout.readline, b''):
+                if not self._running:
+                    proc.kill()
+                    break
+                line = raw.decode('utf-8', errors='ignore').strip()
+                if not line or '=' not in line:
+                    continue
+                key, _, value = line.partition('=')
+                if key == 'out_time_us' and total_us > 0:
+                    try:
+                        cur_us = max(0, int(value))
+                    except ValueError:
+                        continue
+                    pct = progress_lo + int(
+                        (cur_us / total_us) * (progress_hi - progress_lo))
+                    pct = max(progress_lo, min(progress_hi, pct))
+                    if pct != last_pct:
+                        last_pct = pct
+                        self.progress.emit(pct)
+                elif key == 'progress' and value == 'end':
+                    self.progress.emit(progress_hi)
+        except Exception as exc:
+            print(f"[DEBUG] progress reader error: {exc}")
+
+        try:
+            proc.wait(timeout=timeout)
+        except subprocess.TimeoutExpired:
+            proc.kill()
+            t.join(timeout=2)
+            return -1, b''.join(stderr_chunks)
+        t.join(timeout=2)
+        return proc.returncode, b''.join(stderr_chunks)
 
     def _escape_drawtext_text(self, text):
         """Escape text for FFmpeg drawtext filter."""
@@ -267,6 +353,10 @@ Format: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text
             self.progress.emit(20)
             self.status.emit("Render video...")
 
+            # Probe input duration once — we'll use it to translate
+            # FFmpeg's -progress out_time_us into real %.
+            total_us = self._probe_video_duration_us(self.input_video)
+
             # ── Build FFmpeg command ──
             gpu_device = config.get('gpu_device', 'auto')
             encoders = self._build_universal_encoder_list(gpu_device)
@@ -411,20 +501,18 @@ Format: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text
                 cmd.extend(['-shortest', self.output_video])
 
                 try:
-                    proc = subprocess.Popen(
-                        cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
-                        creationflags=getattr(subprocess, 'CREATE_NO_WINDOW', 0))
-                    _, stderr = proc.communicate(timeout=1800)
-                    if proc.returncode == 0:
+                    rc, stderr = self._run_ffmpeg_with_progress(
+                        cmd, total_us=total_us,
+                        progress_lo=20, progress_hi=90, timeout=1800)
+                    if rc == 0:
                         self.status.emit(f"✓ Encoder: {enc_desc}")
                         success = True
                         break
+                    elif rc == -1:
+                        print(f"[DEBUG] {enc_desc} timeout")
                     else:
                         err = stderr.decode('utf-8', errors='ignore').lower()
                         print(f"[DEBUG] {enc_desc} lỗi: {err[:300]}")
-                except subprocess.TimeoutExpired:
-                    proc.kill()
-                    print(f"[DEBUG] {enc_desc} timeout")
                 except Exception as e:
                     print(f"[DEBUG] {enc_desc} exception: {e}")
 

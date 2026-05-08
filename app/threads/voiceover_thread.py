@@ -3,9 +3,43 @@ Voice-Over Thread — Edge TTS, Google TTS, ElevenLabs
 """
 import os
 import asyncio
+import shutil
+import subprocess
+import sys
 from pathlib import Path
 from PyQt6.QtCore import QThread, pyqtSignal
-from app.utils.config import BASE_DIR, VOICE_CONFIGS_EDGE_VI
+from app.utils.config import BASE_DIR, FFMPEG_PATH, VOICE_CONFIGS_EDGE_VI
+
+# Cap concurrent Edge TTS requests — the public service rate-limits
+# aggressive callers, so a small pool keeps things fast without 429s.
+_EDGE_TTS_CONCURRENCY = 4
+
+
+def _ffmpeg_executable():
+    """Return the bundled ffmpeg(.exe) if present, else 'ffmpeg' on $PATH."""
+    if os.path.exists(FFMPEG_PATH):
+        return FFMPEG_PATH
+    return shutil.which('ffmpeg') or 'ffmpeg'
+
+
+def _atempo_chain(factor):
+    """FFmpeg atempo accepts 0.5–2.0 per filter; chain for outside that range.
+
+    `atempo` preserves pitch while changing tempo — unlike pydub's
+    frame_rate trick which shifts pitch like a chipmunk.
+    """
+    if factor <= 0:
+        return None
+    parts = []
+    remaining = float(factor)
+    while remaining > 2.0:
+        parts.append('atempo=2.0')
+        remaining /= 2.0
+    while remaining < 0.5:
+        parts.append('atempo=0.5')
+        remaining /= 0.5
+    parts.append(f'atempo={remaining:.6f}')
+    return ','.join(parts)
 
 
 class VoiceOverThread(QThread):
@@ -15,7 +49,7 @@ class VoiceOverThread(QThread):
 
     def __init__(self, subtitles, voice_type='Alex (Nam chuẩn)',
                  speech_rate=100, volume=100, provider='Edge TTS (miễn phí)',
-                 target_lang='vi'):
+                 target_lang='vi', fit_to_subtitle=True):
         super().__init__()
         self.subtitles = subtitles
         self.voice_type = voice_type
@@ -23,6 +57,9 @@ class VoiceOverThread(QThread):
         self.volume = volume
         self.provider = provider
         self.target_lang = target_lang
+        # When True, each segment is squeezed/stretched (pitch-preserving) to
+        # match its subtitle slot duration so it doesn't bleed into the next.
+        self.fit_to_subtitle = fit_to_subtitle
         self._running = True
 
     def run(self):
@@ -75,7 +112,6 @@ class VoiceOverThread(QThread):
         try:
             import edge_tts
         except ImportError:
-            import subprocess, sys
             subprocess.run([sys.executable, '-m', 'pip', 'install', 'edge-tts'],
                           creationflags=getattr(subprocess, 'CREATE_NO_WINDOW', 0))
             import edge_tts
@@ -89,36 +125,45 @@ class VoiceOverThread(QThread):
         if not voice_choice:
             voice_choice = VOICE_CONFIGS_EDGE_VI[0]
 
-        segments = []
-        total = len(processed_subs)
+        # Compute rate once — same for every segment
+        user_rate_pct = self.speech_rate - 100  # -50..+100
+        rate_str = f"{'+' if user_rate_pct >= 0 else ''}{user_rate_pct}%"
+        pitch = voice_choice.get('pitch', '+0Hz')
 
-        # Use a single event loop for all segments
-        async def generate_all():
-            for i, sub in enumerate(processed_subs):
+        results = [None] * len(processed_subs)
+        total = len(processed_subs)
+        completed = [0]
+        sem = asyncio.Semaphore(_EDGE_TTS_CONCURRENCY)
+
+        async def gen_one(i, sub):
+            if not self._running:
+                return
+            out_path = os.path.join(voice_work_dir, f"voice_{i:04d}.mp3")
+            async with sem:
                 if not self._running:
                     return
-                self.progress.emit(f"Edge TTS: {i+1}/{total}")
-                out_path = os.path.join(voice_work_dir, f"voice_{i:04d}.mp3")
                 try:
-                    # Compute rate from user speed (100=default, 50=slow, 200=fast)
-                    user_rate_pct = self.speech_rate - 100  # -50 to +100
-                    rate_str = f"{'+' if user_rate_pct >= 0 else ''}{user_rate_pct}%"
                     communicate = edge_tts.Communicate(
                         sub['text'], voice_choice['voice'],
-                        pitch=voice_choice.get('pitch', '+0Hz'),
-                        rate=rate_str
-                    )
+                        pitch=pitch, rate=rate_str)
                     await communicate.save(out_path)
                     if os.path.exists(out_path):
-                        segments.append({
+                        results[i] = {
                             'audio_path': out_path,
                             'start_ms': sub['start_ms'],
                             'end_ms': sub['end_ms'],
-                        })
-                except Exception as e:
-                    print(f"[DEBUG] Edge TTS error for segment {i}: {e}")
+                        }
+                except Exception as exc:
+                    print(f"[DEBUG] Edge TTS error for segment {i}: {exc}")
+            completed[0] += 1
+            self.progress.emit(f"Edge TTS: {completed[0]}/{total}")
 
-        # Run all in single loop
+        async def generate_all():
+            await asyncio.gather(
+                *(gen_one(i, s) for i, s in enumerate(processed_subs)),
+                return_exceptions=False,
+            )
+
         loop = asyncio.new_event_loop()
         asyncio.set_event_loop(loop)
         try:
@@ -126,14 +171,13 @@ class VoiceOverThread(QThread):
         finally:
             loop.close()
 
-        return segments
+        return [r for r in results if r is not None]
 
     def _generate_google_tts(self, processed_subs, voice_work_dir):
         """Generate voice using Google TTS (gTTS)."""
         try:
             from gtts import gTTS
         except ImportError:
-            import subprocess, sys
             subprocess.run([sys.executable, '-m', 'pip', 'install', 'gtts'],
                           creationflags=getattr(subprocess, 'CREATE_NO_WINDOW', 0))
             from gtts import gTTS
@@ -151,19 +195,12 @@ class VoiceOverThread(QThread):
                 tts = gTTS(text=sub['text'], lang=self.target_lang)
                 tts.save(out_path)
 
-                # Apply speed change if user requested non-default speed
+                # Pitch-preserving speed change via FFmpeg atempo
+                # (the previous frame_rate hack pitched voices like a
+                # chipmunk).
                 if self.speech_rate != 100 and os.path.exists(out_path):
-                    try:
-                        from pydub import AudioSegment
-                        audio = AudioSegment.from_mp3(out_path)
-                        speed_factor = self.speech_rate / 100.0
-                        # Change speed by adjusting frame rate
-                        new_audio = audio._spawn(audio.raw_data, overrides={
-                            'frame_rate': int(audio.frame_rate * speed_factor)
-                        }).set_frame_rate(audio.frame_rate)
-                        new_audio.export(out_path, format='mp3')
-                    except ImportError:
-                        pass  # pydub not available, skip speed change
+                    self._apply_atempo_inplace(
+                        out_path, self.speech_rate / 100.0)
 
                 if os.path.exists(out_path):
                     segments.append({
@@ -176,42 +213,90 @@ class VoiceOverThread(QThread):
 
         return segments
 
+    def _apply_atempo_inplace(self, mp3_path, factor):
+        """Re-encode mp3_path with FFmpeg atempo (preserves pitch).
+
+        Falls back to a no-op if FFmpeg isn't available.
+        """
+        chain = _atempo_chain(factor)
+        if not chain:
+            return
+        ffmpeg = _ffmpeg_executable()
+        tmp_out = mp3_path + '.atempo.mp3'
+        cmd = [ffmpeg, '-y', '-loglevel', 'error', '-i', mp3_path,
+               '-filter:a', chain, '-c:a', 'libmp3lame', '-q:a', '4', tmp_out]
+        try:
+            subprocess.run(
+                cmd, check=True,
+                creationflags=getattr(subprocess, 'CREATE_NO_WINDOW', 0))
+            os.replace(tmp_out, mp3_path)
+        except Exception as exc:
+            print(f"[DEBUG] atempo failed for {mp3_path}: {exc}")
+            if os.path.exists(tmp_out):
+                try:
+                    os.remove(tmp_out)
+                except OSError:
+                    pass
+
     def _merge_segments(self, segments, output_dir):
-        """Merge all voice segments with exact timeline sync."""
+        """Merge voice segments onto a pre-allocated silent timeline.
+
+        Two upgrades over the previous implementation:
+
+        1. ``combined += seg`` is O(n²) because pydub copies the whole
+           buffer on every concat. We instead allocate one silent
+           buffer of the final length and ``overlay`` each segment at
+           its own ``start_ms`` — O(total audio length).
+        2. If ``fit_to_subtitle`` is on (default), we squash/stretch any
+           segment that exceeds its slot via FFmpeg ``atempo`` so the
+           rendered voice stays aligned with the subtitle track.
+        """
         try:
             from pydub import AudioSegment
         except ImportError:
             self.error.emit("pydub chưa được cài đặt!")
             return None
 
-        final_path = os.path.join(output_dir, 'voiceover_output.mp3')
-        segments.sort(key=lambda s: s['start_ms'])
-
         if not segments:
             return None
 
-        # Build combined audio with silence gaps
-        last_end = 0
-        combined = AudioSegment.silent(duration=0)
+        final_path = os.path.join(output_dir, 'voiceover_output.mp3')
+        segments.sort(key=lambda s: s['start_ms'])
 
+        # Optionally fit each segment to its subtitle slot before merge.
+        if self.fit_to_subtitle:
+            for seg in segments:
+                slot_ms = max(seg['end_ms'] - seg['start_ms'], 1)
+                try:
+                    audio = AudioSegment.from_mp3(seg['audio_path'])
+                except Exception as exc:
+                    print(f"[DEBUG] cannot probe {seg['audio_path']}: {exc}")
+                    continue
+                # Only compress overflow — don't pad short clips with atempo
+                # since silence at the end keeps the voice natural.
+                if len(audio) > slot_ms * 1.05:
+                    factor = len(audio) / slot_ms
+                    self._apply_atempo_inplace(seg['audio_path'], factor)
+
+        # Determine final duration: max(end_ms) plus a small tail.
+        loaded = []
         for seg in segments:
-            start_ms = seg['start_ms']
-            # Add silence gap
-            if start_ms > last_end:
-                gap = start_ms - last_end
-                combined += AudioSegment.silent(duration=gap)
-            elif start_ms < last_end:
-                # Segment overlaps with previous; skip gap (truncate overlap)
-                pass
-
-            # Add voice segment
             try:
                 audio = AudioSegment.from_mp3(seg['audio_path'])
-                combined += audio
-                last_end = start_ms + len(audio)
-            except Exception as e:
-                print(f"[DEBUG] Error loading segment: {e}")
-                last_end = seg.get('end_ms', start_ms)
+            except Exception as exc:
+                print(f"[DEBUG] Error loading segment: {exc}")
+                continue
+            loaded.append((seg['start_ms'], audio))
+
+        if not loaded:
+            return None
+
+        timeline_ms = max(start + len(a) for start, a in loaded)
+        # Add a 200ms tail so the last word isn't clipped.
+        timeline_ms += 200
+        combined = AudioSegment.silent(duration=timeline_ms)
+        for start_ms, audio in loaded:
+            combined = combined.overlay(audio, position=max(0, start_ms))
 
         combined.export(final_path, format='mp3')
         print(f"[DEBUG] Merged voice: {final_path} ({len(combined)}ms)")
