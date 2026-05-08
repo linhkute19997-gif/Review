@@ -83,9 +83,18 @@ class VoiceOverThread(QThread):
         try:
             output_dir = Path(BASE_DIR) / 'output' / 'voice_temp'
             output_dir.mkdir(parents=True, exist_ok=True)
-            # Clean old files
-            for f in output_dir.glob('*.mp3'):
-                f.unlink()
+            # Clean leftovers from previous runs. We sweep BOTH ``*.mp3``
+            # (Edge / Google TTS output, plus the final ``voiceover_output``)
+            # and ``*.wav`` because :meth:`_apply_atempo_to_wav` writes a
+            # ``voice_NNNN.wav`` next to each MP3 when fit-to-subtitle
+            # speeds it up. The old cleanup only matched ``*.mp3`` so
+            # those WAVs piled up across runs and quietly leaked disk.
+            for pattern in ('*.mp3', '*.wav'):
+                for f in output_dir.glob(pattern):
+                    try:
+                        f.unlink()
+                    except OSError:
+                        pass
 
             self.progress.emit("Chuẩn bị phụ đề...")
             processed_subs = []

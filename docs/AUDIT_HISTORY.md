@@ -4,6 +4,91 @@ A running log of code-audit findings and the PRs that addressed them. Newest
 entries on top. Use this as a starting point for the next audit instead of
 re-reading the whole codebase from scratch.
 
+## Round 5 — devin/1778238023-audit-round5
+
+Branch: `devin/1778238023-audit-round5`. Two P2 + two P3 fixes surfaced while
+re-reading the rendering / overlay / TTS paths after PR #11. The first two
+both produce visibly wrong output and the last two are silent quality issues.
+
+### P2-A — `_escape_drawtext_text` doubled every backslash it inserted
+
+`VideoCreatorThread._escape_drawtext_text` iterated
+`["'", ":", "\\", "[", "]"]` and replaced each character with `\<ch>`. Order
+matters: by the time the loop reached `"\\"`, all the backslashes the
+*previous* iterations had just inserted (`\'`, `\:`, etc.) got *themselves*
+escaped too, so a literal apostrophe ended up rendered as `\\\'` and a literal
+`:` as `\\\:`.
+
+User-visible: top-border / bottom-border text and any draggable text overlay
+that contained `'`, `:`, `[`, or `]` rendered in the final video with a
+spurious backslash in front of every special character — and apostrophes in
+particular even risked terminating the single-quoted filtergraph value
+prematurely (FFmpeg single-quoted strings *cannot* be backslash-escaped).
+
+**Fix**: rewrite the helper to escape `\\` *first*, then `:` / `[` / `]`,
+then convert `'` via the canonical FFmpeg close-escape-reopen trick
+(`'\''`). The docstring now also explains why each rule exists.
+
+File: `app/threads/video_creator.py`.
+
+### P2-B — Overlay coordinates were scaled against the view, not the video
+
+`VideoPlayerSection.get_all_overlays` reported `preview_width =
+self.view.width()` and `preview_height = self.view.height()`. Overlay
+coordinates returned by `DraggableTextItem.get_data` /
+`DraggableBlurRegion.get_region_data` are *scene*-space, and
+`_fit_video_to_view` sets `scene.sceneRect()` to `video_item.boundingRect()`
+— so the scene is bounded by the *scaled video item*, not the surrounding
+view (the view is bigger when aspect-ratio letterboxing leaves bars on the
+sides or top/bottom).
+
+`video_creator.run` then computed `scale_x = w / preview_w` and used that
+to map preview pixels to video pixels. With the wrong denominator, every
+text/blur overlay drifted toward the top-left of the rendered video by a
+factor equal to the letterbox ratio — i.e. the more the video was
+letterboxed, the more the overlay slipped away from where the user dragged
+it.
+
+**Fix**: take the size from `self.video_item.size()` instead of
+`self.view.{width,height}()`. The result is bounded by `max(..., 1)` to
+avoid `ZeroDivisionError` if a render is somehow triggered before
+`_fit_video_to_view` runs (the default `QGraphicsVideoItem` size is
+non-zero, so this is purely defensive).
+
+File: `app/video_player.py`.
+
+### P3-A — ChatGPT batch path ignored every API key after the first
+
+`TranslateThread._run_batch_llm._run_one` rotated keys for `Gemini`
+(`api_keys[batch_index % key_count]`) but pinned `ChatGPT` to
+`self.api_keys[0]` regardless of how many keys the user configured. A user
+who plugged two OpenAI keys in for redundancy would silently exhaust the
+first one (and never benefit from the second when it 429ed). The Gemini
+side already had the rotation; ChatGPT was the asymmetry.
+
+**Fix**: hoist the rotation out so both backends share it. ChatGPT now
+gets `api_keys[batch_index % key_count]`; Gemini still receives the full
+list + start index because `_translate_batch_gemini` rotates *internally*
+on transient failures.
+
+File: `app/threads/translate_thread.py`.
+
+### P3-B — Voice-over WAV intermediates piled up across runs
+
+At the start of every `VoiceOverThread.run`, the worker globbed
+`output/voice_temp/*.mp3` to clear leftovers from the previous render — but
+`_apply_atempo_to_wav` writes a `voice_NNNN.wav` next to each MP3 whenever
+fit-to-subtitle stretches a segment. Those WAVs were never cleaned, so a
+heavy user who renders many videos in one session would see `voice_temp/`
+grow indefinitely, eventually tripping the disk-space guard in
+`VideoCreatorThread._check_disk_space`.
+
+**Fix**: extend the cleanup loop to sweep both `*.mp3` and `*.wav`, with
+per-file `OSError` swallowing so a stuck handle on one file doesn't stop
+us from clearing the rest.
+
+File: `app/threads/voiceover_thread.py`.
+
 ## Round 4 — devin/1778237716-audit-round4
 
 Branch: `devin/1778237716-audit-round4`. Two P1 + two P2 fixes surfaced while

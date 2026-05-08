@@ -456,11 +456,22 @@ class TranslateThread(QThread):
         def _run_one(batch_index: int, batch):
             if not self._running:
                 return []
+            # Rotate keys for BOTH Gemini and ChatGPT — the previous
+            # implementation pinned ChatGPT to ``api_keys[0]``, so a
+            # user with multiple OpenAI keys configured for redundancy
+            # would silently exhaust just the first one (and never
+            # benefit from the second when it 429ed).
+            if self.api_keys:
+                key_index = batch_index % key_count
+                api_key = self.api_keys[key_index]
+            else:
+                key_index = 0
+                api_key = ''
             if self.model == 'Gemini':
-                key_index = batch_index % key_count if self.api_keys else 0
+                # Gemini batch helper rotates internally on transient
+                # failures, so it gets the full key list + start index.
                 return list(_translate_batch_gemini(
                     batch, dest_name, self.api_keys, key_index))
-            api_key = self.api_keys[0] if self.api_keys else ''
             return list(_translate_batch_chatgpt(batch, dest_name, api_key))
 
         with ThreadPoolExecutor(

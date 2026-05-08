@@ -213,9 +213,30 @@ class VideoCreatorThread(QThread):
         return proc.returncode, b''.join(stderr_chunks)
 
     def _escape_drawtext_text(self, text):
-        """Escape text for FFmpeg drawtext filter."""
-        for ch in ["'", ":", "\\", "[", "]"]:
-            text = str(text).replace(ch, f"\\{ch}")
+        """Escape text for the FFmpeg ``drawtext`` filter argument.
+
+        The caller wraps the result in single quotes
+        (``text='…'``). Two non-obvious rules drive the escape order:
+
+        * ``\\`` MUST be escaped FIRST. The previous implementation
+          escaped ``\\`` last, after escapes for ``'`` / ``:`` /
+          ``[`` / ``]`` had already inserted fresh backslashes —
+          which then got *themselves* doubled, so a literal apostrophe
+          ended up rendered as ``\\\\\\'`` in the output video.
+        * Single quotes cannot be backslash-escaped inside a
+          single-quoted filtergraph value (the closing ``'`` ends
+          the quoted segment regardless of any preceding ``\\``). The
+          canonical FFmpeg workaround is the shell-style
+          close-escape-reopen pattern: ``'`` → ``'\\''`` so
+          ``It's`` becomes ``'It'\\''s'`` which the parser reassembles
+          back into ``It's``.
+        """
+        text = str(text)
+        # Escape backslashes first — see method docstring.
+        text = text.replace('\\', '\\\\')
+        for ch in (':', '[', ']'):
+            text = text.replace(ch, '\\' + ch)
+        text = text.replace("'", "'\\''")
         return text
 
     def _generate_ass_subtitle(self, subtitles, config, output_path):
