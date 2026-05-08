@@ -1,14 +1,19 @@
 """
 Voice-Over Thread — Edge TTS, Google TTS, ElevenLabs
 """
-import os
 import asyncio
+import os
 import shutil
 import subprocess
 import sys
 from pathlib import Path
+
 from PyQt6.QtCore import QThread, pyqtSignal
+
 from app.utils.config import BASE_DIR, FFMPEG_PATH, VOICE_CONFIGS_EDGE_VI
+from app.utils.logger import get_logger
+
+logger = get_logger('voiceover')
 
 # Cap concurrent Edge TTS requests — the public service rate-limits
 # aggressive callers, so a small pool keeps things fast without 429s.
@@ -85,7 +90,7 @@ class VoiceOverThread(QThread):
                 self.error.emit("Không có phụ đề để lồng tiếng!")
                 return
 
-            print(f"[DEBUG] Processed {len(processed_subs)} subtitles")
+            logger.debug("Processed %d subtitles", len(processed_subs))
 
             if 'Edge' in self.provider:
                 segments = self._generate_edge_tts(processed_subs, str(output_dir))
@@ -154,7 +159,7 @@ class VoiceOverThread(QThread):
                             'end_ms': sub['end_ms'],
                         }
                 except Exception as exc:
-                    print(f"[DEBUG] Edge TTS error for segment {i}: {exc}")
+                    logger.debug("Edge TTS error for segment %s: %s", i, exc)
             completed[0] += 1
             self.progress.emit(f"Edge TTS: {completed[0]}/{total}")
 
@@ -209,7 +214,7 @@ class VoiceOverThread(QThread):
                         'end_ms': sub['end_ms'],
                     })
             except Exception as e:
-                print(f"[DEBUG] Google TTS error for segment {i}: {e}")
+                logger.debug("Google TTS error for segment %s: %s", i, e)
 
         return segments
 
@@ -231,7 +236,7 @@ class VoiceOverThread(QThread):
                 creationflags=getattr(subprocess, 'CREATE_NO_WINDOW', 0))
             os.replace(tmp_out, mp3_path)
         except Exception as exc:
-            print(f"[DEBUG] atempo failed for {mp3_path}: {exc}")
+            logger.debug("atempo failed for %s: %s", mp3_path, exc)
             if os.path.exists(tmp_out):
                 try:
                     os.remove(tmp_out)
@@ -270,7 +275,7 @@ class VoiceOverThread(QThread):
                 try:
                     audio = AudioSegment.from_mp3(seg['audio_path'])
                 except Exception as exc:
-                    print(f"[DEBUG] cannot probe {seg['audio_path']}: {exc}")
+                    logger.debug("cannot probe %s: %s", seg['audio_path'], exc)
                     continue
                 # Only compress overflow — don't pad short clips with atempo
                 # since silence at the end keeps the voice natural.
@@ -284,7 +289,7 @@ class VoiceOverThread(QThread):
             try:
                 audio = AudioSegment.from_mp3(seg['audio_path'])
             except Exception as exc:
-                print(f"[DEBUG] Error loading segment: {exc}")
+                logger.debug("Error loading segment: %s", exc)
                 continue
             loaded.append((seg['start_ms'], audio))
 
@@ -299,7 +304,7 @@ class VoiceOverThread(QThread):
             combined = combined.overlay(audio, position=max(0, start_ms))
 
         combined.export(final_path, format='mp3')
-        print(f"[DEBUG] Merged voice: {final_path} ({len(combined)}ms)")
+        logger.debug("Merged voice: %s (%dms)", final_path, len(combined))
         return final_path
 
     def _parse_srt_time(self, time_str):

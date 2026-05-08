@@ -1,0 +1,17 @@
+# Review Phim Pro — Developer Tooling
+#
+# Install with: ``pip install -r requirements-dev.txt``
+# Pulls runtime deps too via the ``-r`` include below.
+
+-r requirements.txt
+
+# Linting / static analysis
+ruff~=0.4
+pyflakes~=3.2
+
+# Type checking
+mypy~=1.10
+
+# Testing (none yet, but ready for Phase 4)
+pytest~=8.2
+pytest-qt~=4.4

@@ -23,7 +23,10 @@ from app.utils.config import (
     load_user_preferences, save_user_preferences,
     LANGUAGES, TRANSLATION_MODELS
 )
+from app.utils.logger import get_logger
 from app.utils.srt_parser import parse_srt
+
+logger = get_logger('main_window')
 
 
 class _PreviewThread(QThread):
@@ -805,8 +808,8 @@ class MainWindow(QMainWindow):
 
     def _on_batch_error(self, msg):
         self.render_section.table.setItem(
-            self._batch_index, 3, QTableWidgetItem(f"❌ Lỗi"))
-        print(f"[BATCH ERROR] {msg}")
+            self._batch_index, 3, QTableWidgetItem("❌ Lỗi"))
+        logger.error("Batch render item %s failed: %s", self._batch_index, msg)
         self._batch_index += 1
         # If last item errored, re-enable button
         if self._batch_index >= len(self._batch_queue):

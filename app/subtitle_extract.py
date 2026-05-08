@@ -4,13 +4,18 @@ Subtitle Extract Page — Whisper (audio) + PaddleOCR (visual)
 import os
 import sys
 from pathlib import Path
+
 from PyQt6.QtWidgets import (
     QWidget, QVBoxLayout, QHBoxLayout, QLabel, QPushButton, QLineEdit,
     QComboBox, QFileDialog, QTabWidget, QProgressBar,
     QMessageBox, QDialog, QDoubleSpinBox
 )
 from PyQt6.QtCore import QThread, pyqtSignal
+
 from app.utils.config import WHISPER_MODEL_OPTIONS, BASE_DIR
+from app.utils.logger import get_logger
+
+logger = get_logger('subtitle_extract')
 
 # Module-level caches — Whisper and PaddleOCR each take ~30–60s to
 # load from disk; without these every extract reloaded them.
@@ -111,11 +116,11 @@ class SubtitleExtractThread(QThread):
             import torch
             if torch.cuda.is_available():
                 name = torch.cuda.get_device_name(0)
-                print(f"[DEBUG] GPU detected: {name}")
+                logger.info("GPU detected: %s", name)
                 return 'cuda'
         except (ImportError, Exception):
             pass
-        print("[DEBUG] Using CPU")
+        logger.info("Using CPU for inference")
         return 'cpu'
 
     def run(self):

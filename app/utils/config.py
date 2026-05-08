@@ -4,10 +4,8 @@ Configuration Management
 API keys, user preferences, and translation styles persistence.
 """
 
-import json
-import os
 from pathlib import Path
-from typing import Dict, List, Any, Optional
+from typing import Dict, List
 
 # Base directory (where the app is launched from)
 BASE_DIR = Path(__file__).parent.parent.parent.resolve()
@@ -192,62 +190,196 @@ UI_TRANSLATIONS = {
 # ═══════════════════════════════════════════════════════════
 # Config I/O
 # ═══════════════════════════════════════════════════════════
+#
+# All four config files are read/written via the atomic helpers in
+# ``app.utils.atomic_io`` so a crash mid-save can never produce an
+# empty/corrupt JSON file. API keys are persisted through
+# ``app.utils.key_vault`` instead of plaintext JSON; the JSON only
+# contains opaque ``vault:<service>:<id>`` references.
+# Existing plaintext ``api_config.json`` files are migrated on first
+# load — see ``_migrate_api_config_inplace``.
+
+def _normalise_api_keys(value) -> List[str]:
+    if isinstance(value, list):
+        return [str(v) for v in value if isinstance(v, (str, int))]
+    if isinstance(value, str):
+        return [value] if value else []
+    return []
+
+
+def _migrate_api_config_inplace(config: Dict) -> bool:
+    """Move any plaintext keys into the vault. Returns True when changed."""
+    from app.utils import key_vault  # local import: vault lazily loads
+    changed = False
+    for model_name, entry in list(config.items()):
+        if not isinstance(entry, dict):
+            continue
+        api_key = entry.get('api_key')
+        keys = _normalise_api_keys(api_key)
+        if not keys:
+            continue
+        # Already migrated → all entries are vault refs.
+        if all(key_vault.is_ref(k) for k in keys):
+            continue
+        new_refs: List[str] = []
+        for idx, key in enumerate(keys):
+            if key_vault.is_ref(key):
+                new_refs.append(key)
+                continue
+            ref = key_vault.make_ref(model_name, idx)
+            try:
+                key_vault.store(ref, key)
+                new_refs.append(ref)
+                changed = True
+            except Exception:
+                # Cannot store → leave plaintext to avoid losing it.
+                new_refs.append(key)
+        entry['api_key'] = new_refs if len(new_refs) != 1 else new_refs[0]
+    return changed
+
+
+def _materialise_api_keys(config: Dict) -> Dict:
+    """Return a copy of ``config`` with vault refs resolved to plaintext."""
+    from app.utils import key_vault
+    out: Dict = {}
+    for model_name, entry in config.items():
+        if not isinstance(entry, dict):
+            out[model_name] = entry
+            continue
+        copy = dict(entry)
+        api_key = copy.get('api_key')
+        keys = _normalise_api_keys(api_key)
+        resolved = [key_vault.resolve(k) for k in keys]
+        resolved = [str(k) for k in resolved if isinstance(k, (str, bytes)) and k]
+        if not resolved:
+            copy['api_key'] = ''
+        elif len(resolved) == 1:
+            copy['api_key'] = resolved[0]
+        else:
+            copy['api_key'] = resolved
+        out[model_name] = copy
+    return out
+
 
 def load_api_config() -> Dict:
-    """Load API configuration from file."""
-    try:
-        if os.path.exists(API_CONFIG_FILE):
-            with open(API_CONFIG_FILE, 'r', encoding='utf-8') as f:
-                return json.load(f)
-    except Exception:
-        pass
-    return {}
+    """Load API configuration, migrating any plaintext keys to the vault.
+
+    Returns a dict where ``api_key`` values are plaintext strings (or
+    lists), matching the historical contract. Internally the JSON only
+    stores vault references after the first save.
+    """
+    from app.utils.atomic_io import atomic_write_json, read_json
+    from app.utils.logger import get_logger
+
+    logger = get_logger('config')
+    raw = read_json(API_CONFIG_FILE, {}) or {}
+    if not isinstance(raw, dict):
+        logger.warning("api_config.json malformed, ignoring")
+        return {}
+
+    if _migrate_api_config_inplace(raw):
+        try:
+            atomic_write_json(API_CONFIG_FILE, raw)
+            logger.info("Migrated plaintext API keys into vault")
+        except Exception as exc:
+            logger.warning("Failed to persist migrated api_config: %s", exc)
+
+    return _materialise_api_keys(raw)
 
 
 def save_api_config(config: Dict):
-    """Save API configuration to file."""
+    """Persist API config, storing API keys in the vault."""
+    from app.utils.atomic_io import atomic_write_json, read_json
+    from app.utils.logger import get_logger
+    from app.utils import key_vault
+
+    logger = get_logger('config')
+
+    existing = read_json(API_CONFIG_FILE, {}) or {}
+    if not isinstance(existing, dict):
+        existing = {}
+
+    # Build the JSON-safe view: vault refs only.
+    on_disk: Dict = dict(existing)
+    for model_name, entry in config.items():
+        if not isinstance(entry, dict):
+            on_disk[model_name] = entry
+            continue
+        api_key = entry.get('api_key')
+        keys = _normalise_api_keys(api_key)
+
+        # Determine new refs, reusing previous ref slots so unchanged
+        # secrets stay at the same vault keys.
+        prev = existing.get(model_name) or {}
+        prev_refs = _normalise_api_keys(prev.get('api_key'))
+
+        new_refs: List[str] = []
+        for idx, plain in enumerate(keys):
+            if key_vault.is_ref(plain):
+                new_refs.append(plain)
+                continue
+            ref = key_vault.make_ref(model_name, idx)
+            try:
+                key_vault.store(ref, plain)
+                new_refs.append(ref)
+            except Exception as exc:
+                logger.warning("Vault store failed (%s); keeping plaintext", exc)
+                new_refs.append(plain)
+
+        # Delete vault entries that no longer have a counterpart.
+        for stale_ref in prev_refs[len(new_refs):]:
+            if key_vault.is_ref(stale_ref):
+                try:
+                    key_vault.delete(stale_ref)
+                except Exception:
+                    pass
+
+        new_entry = {k: v for k, v in entry.items() if k != 'api_key'}
+        if not new_refs:
+            new_entry['api_key'] = ''
+        elif len(new_refs) == 1:
+            new_entry['api_key'] = new_refs[0]
+        else:
+            new_entry['api_key'] = new_refs
+        on_disk[model_name] = new_entry
+
     try:
-        with open(API_CONFIG_FILE, 'w', encoding='utf-8') as f:
-            json.dump(config, f, indent=2, ensure_ascii=False)
-    except Exception as e:
-        print(f"[ERROR] save_api_config: {e}")
+        atomic_write_json(API_CONFIG_FILE, on_disk)
+    except Exception as exc:
+        logger.error("save_api_config failed: %s", exc)
 
 
 def load_user_preferences() -> Dict:
     """Load user preferences from file."""
-    try:
-        if os.path.exists(USER_PREFERENCES_FILE):
-            with open(USER_PREFERENCES_FILE, 'r', encoding='utf-8') as f:
-                return json.load(f)
-    except Exception:
-        pass
-    return {}
+    from app.utils.atomic_io import read_json
+    data = read_json(USER_PREFERENCES_FILE, {}) or {}
+    return data if isinstance(data, dict) else {}
 
 
 def save_user_preferences(prefs: Dict):
     """Save user preferences to file."""
+    from app.utils.atomic_io import atomic_write_json
+    from app.utils.logger import get_logger
     try:
-        with open(USER_PREFERENCES_FILE, 'w', encoding='utf-8') as f:
-            json.dump(prefs, f, indent=2, ensure_ascii=False)
-    except Exception as e:
-        print(f"[ERROR] save_user_preferences: {e}")
+        atomic_write_json(USER_PREFERENCES_FILE, prefs)
+    except Exception as exc:
+        get_logger('config').error("save_user_preferences failed: %s", exc)
 
 
 def load_styles_config() -> List[str]:
     """Load translation styles from file."""
-    try:
-        if os.path.exists(STYLES_CONFIG_FILE):
-            with open(STYLES_CONFIG_FILE, 'r', encoding='utf-8') as f:
-                return json.load(f)
-    except Exception:
-        pass
+    from app.utils.atomic_io import read_json
+    data = read_json(STYLES_CONFIG_FILE, None)
+    if isinstance(data, list) and data:
+        return [str(s) for s in data]
     return list(DEFAULT_STYLES)
 
 
 def save_styles_config(styles: List[str]):
     """Save translation styles to file."""
+    from app.utils.atomic_io import atomic_write_json
+    from app.utils.logger import get_logger
     try:
-        with open(STYLES_CONFIG_FILE, 'w', encoding='utf-8') as f:
-            json.dump(styles, f, indent=2, ensure_ascii=False)
-    except Exception as e:
-        print(f"[ERROR] save_styles_config: {e}")
+        atomic_write_json(STYLES_CONFIG_FILE, list(styles))
+    except Exception as exc:
+        get_logger('config').error("save_styles_config failed: %s", exc)

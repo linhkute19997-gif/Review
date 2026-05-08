@@ -8,10 +8,14 @@ from PyQt6.QtWidgets import (
     QScrollArea, QSizePolicy, QGroupBox
 )
 from PyQt6.QtCore import Qt
+
 from app.utils.config import (
     LANGUAGES, TRANSLATION_MODELS, DEFAULT_STYLES, VOICE_CONFIGS_EDGE_VI,
     load_styles_config, load_user_preferences, save_user_preferences
 )
+from app.utils.logger import get_logger
+
+logger = get_logger('config_section')
 
 
 def make_label(text, style=""):
@@ -590,7 +594,7 @@ class ConfigSection(QWidget):
                 text=self.bot_text.text(),
                 text_color=self._get_button_color(self.btn_bot_text_color))
         except Exception as exc:  # noqa: BLE001
-            print(f"[DEBUG] live preview update failed: {exc}")
+            logger.debug("live preview update failed: %s", exc)
 
     def get_config(self) -> dict:
         audio_mode = self.audio_group.checkedId()
