@@ -1,0 +1,794 @@
+"""
+Main Window — Central orchestrator for the application.
+"""
+import os
+import sys
+from pathlib import Path
+from PyQt6.QtWidgets import (
+    QMainWindow, QWidget, QVBoxLayout, QHBoxLayout, QLabel, QPushButton,
+    QLineEdit, QSplitter, QStackedWidget, QFileDialog, QMessageBox,
+    QApplication, QSizePolicy, QTableWidgetItem
+)
+from PyQt6.QtCore import Qt, QSize, QUrl, QThread, pyqtSignal
+from PyQt6.QtGui import QIcon, QAction
+
+from app.video_player import VideoPlayerSection
+from app.config_section import ConfigSection
+from app.subtitle_edit import SubtitleEditSection
+from app.render_section import RenderSection
+from app.utils.config import (
+    BASE_DIR, UI_TRANSLATIONS, load_api_config,
+    LANGUAGES, TRANSLATION_MODELS
+)
+from app.utils.srt_parser import parse_srt
+
+
+class _PreviewThread(QThread):
+    """Background thread for voice preview generation (Edge TTS)."""
+    done = pyqtSignal(str)
+    err = pyqtSignal(str)
+
+    def __init__(self, vc, rate_str, text, path):
+        super().__init__()
+        self.vc = vc
+        self.rate_str = rate_str
+        self.text = text
+        self.path = path
+
+    def run(self):
+        import asyncio
+        try:
+            import edge_tts
+        except ImportError:
+            self.err.emit("edge-tts chưa được cài đặt")
+            return
+
+        async def gen():
+            communicate = edge_tts.Communicate(
+                self.text, self.vc['voice'],
+                pitch=self.vc.get('pitch', '+0Hz'),
+                rate=self.rate_str)
+            await communicate.save(self.path)
+
+        loop = asyncio.new_event_loop()
+        asyncio.set_event_loop(loop)
+        try:
+            loop.run_until_complete(gen())
+            self.done.emit(self.path)
+        except Exception as exc:
+            self.err.emit(str(exc))
+        finally:
+            loop.close()
+
+
+class MainWindow(QMainWindow):
+    def __init__(self):
+        super().__init__()
+        self.setWindowTitle("Review Phim Pro | V1.0.0")
+        self.setMinimumSize(1100, 750)
+        self.resize(1280, 900)
+
+        self._lang = 'vi'
+        self.current_render_session = None
+        self.video_files = []
+        self.srt_files = []
+        self.translate_thread = None
+        self.render_thread = None
+        self.voiceover_thread = None
+        self._batch_pairs = []
+
+        # Load QSS
+        qss_path = Path(__file__).parent / 'styles' / 'dark_theme.qss'
+        if qss_path.exists():
+            self.setStyleSheet(qss_path.read_text(encoding='utf-8'))
+
+        self._build_menu()
+        self._build_ui()
+
+    # ═══════════════════════════════════════════════════════
+    # Menu Bar
+    # ═══════════════════════════════════════════════════════
+    def _build_menu(self):
+        menubar = self.menuBar()
+
+        # System menu
+        system_menu = menubar.addMenu("⚙️ Hệ Thống")
+        info_action = QAction("Thông tin cấu hình", self)
+        info_action.triggered.connect(self._show_system_info)
+        system_menu.addAction(info_action)
+
+        clear_cache = QAction("Xóa Cache cấu hình", self)
+        clear_cache.triggered.connect(self._clear_encoder_cache)
+        system_menu.addAction(clear_cache)
+
+        test_action = QAction("Test cấu hình", self)
+        test_action.triggered.connect(self._test_encoders)
+        system_menu.addAction(test_action)
+        self.menus = {'system': system_menu}
+
+        # Language menu
+        lang_menu = menubar.addMenu("Ngôn Ngữ")
+        action_vi = QAction("Tiếng Việt", self)
+        action_vi.triggered.connect(lambda: self.switch_ui_language('vi'))
+        lang_menu.addAction(action_vi)
+        action_en = QAction("Tiếng Anh", self)
+        action_en.triggered.connect(lambda: self.switch_ui_language('en'))
+        lang_menu.addAction(action_en)
+
+        # Tools menu
+        tools_menu = menubar.addMenu("Công Cụ")
+        douyin_action = QAction("Tải Video Douyin/TikTok", self)
+        douyin_action.triggered.connect(self._open_douyin_download_dialog)
+        tools_menu.addAction(douyin_action)
+
+        add_text_action = QAction("Thêm Text Overlay", self)
+        add_text_action.triggered.connect(self._add_text_overlay)
+        tools_menu.addAction(add_text_action)
+
+        add_blur_action = QAction("Thêm Vùng Blur", self)
+        add_blur_action.triggered.connect(self._add_blur_overlay)
+        tools_menu.addAction(add_blur_action)
+
+        snow_action = QAction("❄ Tuyết Rơi", self)
+        snow_action.setCheckable(True)
+        snow_action.toggled.connect(self._toggle_snowflake)
+        tools_menu.addAction(snow_action)
+
+    # ═══════════════════════════════════════════════════════
+    # Main UI
+    # ═══════════════════════════════════════════════════════
+    def _build_ui(self):
+        self.stack = QStackedWidget()
+        self.setCentralWidget(self.stack)
+
+        editor_page = QWidget()
+        editor_layout = QVBoxLayout(editor_page)
+        editor_layout.setContentsMargins(8, 4, 8, 4)
+        editor_layout.setSpacing(4)
+
+        # ── Toolbar row ──
+        toolbar = QHBoxLayout()
+        toolbar.setSpacing(6)
+
+        toolbar.addWidget(QLabel("🎬"))
+        lbl_vg = QLabel("Video Gốc:")
+        lbl_vg.setProperty("class", "labelDim")
+        lbl_vg.setFixedWidth(70)
+        toolbar.addWidget(lbl_vg)
+
+        self.video_input = QLineEdit()
+        self.video_input.setPlaceholderText("Chọn video gốc...")
+        toolbar.addWidget(self.video_input)
+
+        btn_video = QPushButton("📂")
+        btn_video.setFixedWidth(36)
+        btn_video.clicked.connect(self._select_video_file)
+        toolbar.addWidget(btn_video)
+
+        div = QLabel("|")
+        div.setStyleSheet("background:#2a2a4e;")
+        div.setFixedWidth(2)
+        toolbar.addWidget(div)
+
+        btn_extract = QPushButton("✂ TÁCH PHỤ ĐỀ")
+        btn_extract.setObjectName("btnTachPhuDe")
+        btn_extract.clicked.connect(self._open_extract_subtitle_dialog)
+        toolbar.addWidget(btn_extract)
+
+        toolbar.addWidget(QLabel("📄"))
+        lbl_srt = QLabel("SRT:")
+        lbl_srt.setProperty("class", "labelDim")
+        lbl_srt.setFixedWidth(30)
+        toolbar.addWidget(lbl_srt)
+
+        self.srt_input = QLineEdit()
+        self.srt_input.setPlaceholderText("Chọn tệp phụ đề *.srt cần dịch...")
+        toolbar.addWidget(self.srt_input)
+
+        btn_srt = QPushButton("📂")
+        btn_srt.setFixedWidth(36)
+        btn_srt.clicked.connect(self._select_srt_file)
+        toolbar.addWidget(btn_srt)
+
+        btn_batch = QPushButton("📁 Hàng Loạt")
+        btn_batch.setObjectName("btnHangLoat")
+        btn_batch.clicked.connect(self._load_batch_dialog)
+        toolbar.addWidget(btn_batch)
+
+        editor_layout.addLayout(toolbar)
+
+        # ── Content splitter ──
+        content_splitter = QSplitter(Qt.Orientation.Horizontal)
+        content_splitter.setStyleSheet("QSplitter::handle { background: #1e1e3e; }")
+
+        # Left: video player + subtitle editor
+        left = QWidget()
+        left_layout = QVBoxLayout(left)
+        left_layout.setContentsMargins(0, 0, 0, 0)
+        left_layout.setSpacing(4)
+
+        self.video_player = VideoPlayerSection()
+        left_layout.addWidget(self.video_player, 3)
+
+        self.subtitle_edit = SubtitleEditSection()
+        left_layout.addWidget(self.subtitle_edit, 1)
+
+        content_splitter.addWidget(left)
+
+        # Right: config section
+        self.config_section = ConfigSection()
+        self.config_section.set_video_player(self.video_player)
+        self.config_section.btn_translate.clicked.connect(self._start_translate)
+        self.config_section.btn_api_config.clicked.connect(self._open_api_config)
+        self.config_section.btn_style_mgr.clicked.connect(self._open_style_manager)
+        self.config_section.btn_voice_only.clicked.connect(self._start_voiceover)
+        self.config_section.btn_preview_voice.clicked.connect(self._preview_voice)
+        # Wire extract tab button
+        self.config_section.btn_open_extract.clicked.connect(self._open_extract_subtitle_dialog)
+        content_splitter.addWidget(self.config_section)
+
+        content_splitter.setSizes([700, 400])
+        editor_layout.addWidget(content_splitter, 1)
+
+        # ── Render section (bottom) ──
+        render_row = QHBoxLayout()
+        self.render_section = RenderSection()
+        render_row.addWidget(self.render_section, 1)
+
+        self.btn_start_video = QPushButton("▶ BẮT ĐẦU TẠO VIDEO")
+        self.btn_start_video.setObjectName("btnBatDau")
+        self.btn_start_video.setFixedHeight(44)
+        self.btn_start_video.clicked.connect(self._start_create_video)
+        render_row.addWidget(self.btn_start_video)
+
+        self.btn_batch_render = QPushButton("📦 BATCH RENDER")
+        self.btn_batch_render.setObjectName("btnBatDau")
+        self.btn_batch_render.setFixedHeight(44)
+        self.btn_batch_render.clicked.connect(self._start_batch_render)
+        render_row.addWidget(self.btn_batch_render)
+
+        self.btn_save_srt = QPushButton("💾 LƯU SRT")
+        self.btn_save_srt.setFixedHeight(44)
+        self.btn_save_srt.clicked.connect(self._save_translated_srt)
+        render_row.addWidget(self.btn_save_srt)
+
+        editor_layout.addLayout(render_row)
+
+        self.stack.addWidget(editor_page)
+        self.stack.setCurrentIndex(0)
+
+    # ═══════════════════════════════════════════════════════
+    # File selection
+    # ═══════════════════════════════════════════════════════
+    def _select_video_file(self):
+        fp, _ = QFileDialog.getOpenFileName(
+            self, "Chọn Video", "",
+            "Video Files (*.mp4 *.avi *.mkv *.mov *.webm);;All Files (*)")
+        if fp:
+            self.video_input.setText(fp)
+            self.video_player.load_video(fp)
+
+    def _select_srt_file(self):
+        fp, _ = QFileDialog.getOpenFileName(
+            self, "Chọn tệp SRT", "",
+            "SRT Files (*.srt);;All Files (*)")
+        if fp:
+            self.srt_input.setText(fp)
+            try:
+                with open(fp, 'r', encoding='utf-8-sig') as f:
+                    subs = parse_srt(f.read())
+                self.subtitle_edit.load_subtitles(subs)
+            except Exception as e:
+                QMessageBox.warning(self, "Lỗi", f"Không đọc được SRT:\n{e}")
+
+    def _load_batch_dialog(self):
+        vids, _ = QFileDialog.getOpenFileNames(
+            self, "Chọn nhiều video", "",
+            "Video Files (*.mp4 *.avi *.mkv *.mov);;All (*)")
+        if not vids:
+            return
+        self.video_files = vids
+        srts, _ = QFileDialog.getOpenFileNames(
+            self, "Chọn nhiều SRT", "",
+            "SRT Files (*.srt);;All (*)")
+        if not srts:
+            self.video_files = []  # Clear to prevent mismatch
+            QMessageBox.information(self, "Thông Báo", "Đã hủy chọn batch.")
+            return
+        self.srt_files = srts
+        QMessageBox.information(self, "Batch",
+            f"Đã chọn {len(self.video_files)} video + {len(self.srt_files)} SRT")
+
+    # ═══════════════════════════════════════════════════════
+    # Translation
+    # ═══════════════════════════════════════════════════════
+    def _start_translate(self):
+        # Guard against duplicate threads
+        if self.translate_thread and self.translate_thread.isRunning():
+            QMessageBox.warning(self, "Thông Báo", "Đang dịch! Vui lòng chờ hoàn thành.")
+            return
+        srt_path = self.srt_input.text()
+        if not srt_path or not os.path.exists(srt_path):
+            QMessageBox.warning(self, "Lỗi", "Chọn tệp SRT trước!")
+            return
+        try:
+            with open(srt_path, 'r', encoding='utf-8-sig') as f:
+                subs = parse_srt(f.read())
+        except Exception as e:
+            QMessageBox.warning(self, "Lỗi", f"Không đọc được SRT:\n{e}")
+            return
+        if not subs:
+            QMessageBox.warning(self, "Lỗi", "SRT trống!")
+            return
+
+        model = self.config_section.get_selected_model()
+        src = self.config_section.get_source_lang()
+        tgt = self.config_section.get_target_lang()
+        api_config = load_api_config()
+        api_keys = api_config.get(model, {}).get('api_key', '')
+
+        # Disable button while translating
+        self.config_section.btn_translate.setEnabled(False)
+        self.config_section.btn_translate.setText("⏳ Đang dịch...")
+
+        from app.threads.translate_thread import TranslateThread
+        # Use existing edited subtitles if already loaded
+        existing_subs = self.subtitle_edit._subtitles
+        if existing_subs and len(existing_subs) == len(subs):
+            subs = existing_subs  # Preserve user edits
+        else:
+            self.subtitle_edit.load_subtitles(subs)
+
+        self.translate_thread = TranslateThread(subs, 4, src, tgt, model, api_keys)
+        self.translate_thread.progress.connect(self._on_translate_progress)
+        self.translate_thread.finished_signal.connect(self._on_translate_done)
+        self.translate_thread.start()
+
+        self.config_section.translate_status.setText("Đang dịch...")
+
+    def _on_translate_progress(self, index, text):
+        self.subtitle_edit.update_translated(index, text)
+        total = len(self.subtitle_edit._subtitles)
+        self.config_section.translate_progress.setText(f"Tiến trình: {index+1}/{total}")
+
+    def _on_translate_done(self):
+        self.config_section.translate_status.setText("✅ Dịch xong!")
+        self.config_section.translate_progress.setText("")
+        self.config_section.btn_translate.setEnabled(True)
+        self.config_section.btn_translate.setText("▶ Tiến Hành Dịch Phụ Đề")
+        self.translate_thread = None  # Cleanup stale thread reference
+
+    # ═══════════════════════════════════════════════════════
+    # Video creation
+    # ═══════════════════════════════════════════════════════
+    def _start_create_video(self):
+        video_path = self.video_input.text()
+        if not video_path or not os.path.exists(video_path):
+            QMessageBox.warning(self, "⚠️ Chưa Chọn Video",
+                "Vui lòng chọn video gốc trước khi bắt đầu tạo video!")
+            return
+
+        srt_path = self.srt_input.text()
+        subtitles = self.subtitle_edit._subtitles or []
+        if not subtitles and srt_path and os.path.exists(srt_path):
+            try:
+                with open(srt_path, 'r', encoding='utf-8-sig') as f:
+                    subtitles = parse_srt(f.read())
+            except Exception:
+                pass
+
+        config = self.config_section.get_config()
+        overlays = self._collect_overlay_data()
+        base_name = Path(video_path).stem
+        output_dir = str(BASE_DIR / 'output')
+        os.makedirs(output_dir, exist_ok=True)
+        output_video = os.path.join(output_dir, f"{base_name}_output.mp4")
+
+        # Disable button
+        self.btn_start_video.setEnabled(False)
+        self.btn_start_video.setText("⏳ Đang render...")
+
+        from app.threads.video_creator import VideoCreatorThread
+        self.render_thread = VideoCreatorThread(
+            video_path, output_video, config, subtitles, output_dir, overlays)
+        self.render_thread.progress.connect(self._on_video_progress)
+        self.render_thread.status.connect(self._on_video_status)
+        self.render_thread.error.connect(self._on_video_error)
+        self.render_thread.finished_video.connect(self._on_video_finished)
+        self.render_thread.start()
+        self.render_section.set_exporting_status(True, "Detecting...")
+
+    def _on_video_progress(self, value):
+        self.render_section.progress_bar.setValue(value)
+
+    def _on_video_status(self, text):
+        self.render_section.status_label.setText(text)
+
+    def _on_video_error(self, text):
+        QMessageBox.critical(self, "Lỗi Render", text)
+        self.render_section.set_exporting_status(False)
+        self.btn_start_video.setEnabled(True)
+        self.btn_start_video.setText("▶ BẮT ĐẦU TẠO VIDEO")
+        self.render_thread = None
+
+    def _on_video_finished(self, path):
+        self.render_section.set_exporting_status(False)
+        self.btn_start_video.setEnabled(True)
+        self.btn_start_video.setText("▶ BẮT ĐẦU TẠO VIDEO")
+        self.render_thread = None  # Cleanup stale reference
+        QMessageBox.information(self, "Hoàn Thành", f"Video đã được tạo:\n{path}")
+        # Auto shutdown if configured
+        if self.config_section.get_config().get('auto_shutdown'):
+            os.system('shutdown /s /t 60')
+
+    def _save_translated_srt(self):
+        """Save translated subtitles to SRT file."""
+        # Sync edits from table first
+        self.subtitle_edit._sync_table_edits()
+        subs = self.subtitle_edit._subtitles
+        if not subs:
+            QMessageBox.warning(self, "Lỗi", "Chưa có phụ đề để lưu!")
+            return
+        from app.utils.srt_parser import subtitles_to_srt
+        # Default filename from current SRT path or video name
+        default_name = ''
+        if self.srt_input.text():
+            default_name = os.path.splitext(self.srt_input.text())[0] + '_translated.srt'
+        elif self.video_input.text():
+            default_name = os.path.splitext(self.video_input.text())[0] + '_translated.srt'
+        fp, _ = QFileDialog.getSaveFileName(
+            self, "Lưu SRT", default_name, "SRT Files (*.srt);;All (*)")
+        if fp:
+            srt_text = subtitles_to_srt(subs, use_translated=True)
+            with open(fp, 'w', encoding='utf-8') as f:
+                f.write(srt_text)
+            QMessageBox.information(self, "Thành Công", f"Đã lưu SRT:\n{fp}")
+
+    # ═══════════════════════════════════════════════════════
+    # Menu actions
+    # ═══════════════════════════════════════════════════════
+    def switch_ui_language(self, lang):
+        self._lang = lang
+        t = UI_TRANSLATIONS.get(lang, UI_TRANSLATIONS['vi'])
+        self.setWindowTitle(f"Review Phim Pro | V1.0.0 [{lang.upper()}]")
+        self.config_section.translate_status.setText(t.get('ready', 'Sẵn Sàng Dịch'))
+        self.config_section.btn_translate.setText(t.get('btn_start_translate', '▶ Tiến Hành Dịch Phụ Đề'))
+        self.btn_start_video.setText(t.get('btn_start_video', '▶ BẮT ĐẦU TẠO VIDEO'))
+
+    def _show_system_info(self):
+        from app.utils.encoder_detector import EncoderDetector
+        detector = EncoderDetector()
+        enc_info = detector.get_system_info()
+        info = (f"Python: {sys.version}\nPlatform: {sys.platform}\n"
+                f"Base Dir: {BASE_DIR}\n\n{enc_info}")
+        try:
+            import torch
+            if torch.cuda.is_available():
+                info += f"\n\nGPU: {torch.cuda.get_device_name(0)}"
+            else:
+                info += "\nGPU: Not available (CPU mode)"
+        except ImportError:
+            info += "\nGPU: PyTorch not installed"
+        QMessageBox.information(self, "Thông Tin Hệ Thống", info)
+
+    def _clear_encoder_cache(self):
+        from app.utils.encoder_detector import EncoderDetector
+        detector = EncoderDetector()
+        detector.clear_cache()
+        QMessageBox.information(self, "Cache", "Đã xóa cache encoder!")
+
+    def _test_encoders(self):
+        from app.utils.encoder_detector import EncoderDetector
+        detector = EncoderDetector()
+        detector.clear_cache()
+        available = detector.detect_available_encoders()
+        msg = f"Phát hiện {len(available)} encoder:\n"
+        for enc in available:
+            msg += f"  ✓ {enc['description']}\n"
+        QMessageBox.information(self, "Test Encoder", msg)
+
+    def _open_api_config(self):
+        from app.dialogs import APIConfigDialog
+        dialog = APIConfigDialog(self)
+        dialog.exec()
+
+    def _open_style_manager(self):
+        from app.dialogs import StyleManagerDialog
+        dialog = StyleManagerDialog(self)
+        if dialog.exec():
+            self.config_section._load_styles()
+
+    def _open_extract_subtitle_dialog(self):
+        from app.subtitle_extract import SubtitleExtractPage
+        dialog = SubtitleExtractPage(self)
+        dialog.subtitle_extracted.connect(self._on_subtitle_extracted)
+        dialog.exec()
+
+    def _on_subtitle_extracted(self, srt_path):
+        self.srt_input.setText(srt_path)
+        try:
+            with open(srt_path, 'r', encoding='utf-8-sig') as f:
+                subs = parse_srt(f.read())
+            self.subtitle_edit.load_subtitles(subs)
+        except Exception as e:
+            QMessageBox.warning(self, "Lỗi", f"Không đọc được SRT:\n{e}")
+
+    def _add_text_overlay(self):
+        from app.overlays import AddTextDialog, DraggableTextItem
+        data = AddTextDialog.get_data(self)
+        if data:
+            item = DraggableTextItem(100, 100, data['text'], data['font_size'], data['color'])
+            self.video_player.scene.addItem(item)
+
+    def _add_blur_overlay(self):
+        from app.overlays import DraggableBlurRegion
+        item = DraggableBlurRegion(50, 50, 150, 100)
+        self.video_player.scene.addItem(item)
+
+    def _toggle_snowflake(self, checked):
+        if checked:
+            if not hasattr(self, '_snow_overlay') or self._snow_overlay is None:
+                from app.snow_overlay import SnowflakeOverlay
+                self._snow_overlay = SnowflakeOverlay(self)
+                self._snow_overlay.setGeometry(self.rect())
+                self._snow_overlay.show()
+        else:
+            if hasattr(self, '_snow_overlay') and self._snow_overlay:
+                self._snow_overlay.hide()
+                self._snow_overlay.deleteLater()
+                self._snow_overlay = None
+
+    def resizeEvent(self, event):
+        super().resizeEvent(event)
+        if hasattr(self, '_snow_overlay') and self._snow_overlay:
+            self._snow_overlay.setGeometry(self.rect())
+
+    def _open_douyin_download_dialog(self):
+        from app.dialogs import DouyinDownloadDialog
+        dialog = DouyinDownloadDialog(self)
+        dialog.exec()
+
+    def closeEvent(self, event):
+        """Save preferences on exit and stop threads."""
+        self.config_section._save_user_preferences()
+        if hasattr(self, 'translate_thread') and self.translate_thread and self.translate_thread.isRunning():
+            if hasattr(self.translate_thread, 'stop'):
+                self.translate_thread.stop()
+            else:
+                self.translate_thread._running = False
+        if hasattr(self, 'render_thread') and self.render_thread and self.render_thread.isRunning():
+            self.render_thread.stop()
+        if hasattr(self, 'voiceover_thread') and self.voiceover_thread and self.voiceover_thread.isRunning():
+            self.voiceover_thread.stop()
+        super().closeEvent(event)
+
+    def _match_videos_with_subtitles(self, videos, srts):
+        srt_dict = {Path(s).stem: s for s in srts}
+        pairs = []
+        unmatched = []
+        for v in videos:
+            stem = Path(v).stem
+            if stem in srt_dict:
+                pairs.append((v, srt_dict[stem]))
+            else:
+                unmatched.append(v)
+        return pairs, unmatched
+
+    # ═══════════════════════════════════════════════════════
+    # Voice-Over
+    # ═══════════════════════════════════════════════════════
+    def _start_voiceover(self):
+        # Guard against duplicate threads
+        if self.voiceover_thread and self.voiceover_thread.isRunning():
+            QMessageBox.warning(self, "Thông Báo", "Đang tạo lồng tiếng! Vui lòng chờ.")
+            return
+        subs = self.subtitle_edit._subtitles
+        srt_path = self.config_section.voice_srt_input.text()
+        if srt_path and os.path.exists(srt_path):
+            try:
+                with open(srt_path, 'r', encoding='utf-8-sig') as f:
+                    subs = parse_srt(f.read())
+            except Exception:
+                pass
+        if not subs:
+            QMessageBox.warning(self, "Lỗi", "Không có phụ đề để lồng tiếng!")
+            return
+
+        voice_type = self.config_section.combo_voice_type.currentText()
+        speed = self.config_section.voice_speed.value()
+        provider = self.config_section.combo_voice_provider.currentText()
+        target_lang = self.config_section.get_target_lang()
+
+        self.config_section.btn_voice_only.setEnabled(False)
+        self.config_section.btn_voice_only.setText("⏳ Đang tạo...")
+
+        from app.threads.voiceover_thread import VoiceOverThread
+        self.voiceover_thread = VoiceOverThread(subs, voice_type, speed, 100, provider, target_lang)
+        self.voiceover_thread.progress.connect(self._on_voice_progress)
+        self.voiceover_thread.finished_signal.connect(self._on_voice_done)
+        self.voiceover_thread.error.connect(self._on_voice_error)
+        self.voiceover_thread.start()
+
+    def _on_voice_progress(self, msg):
+        self.render_section.status_label.setText(msg)
+
+    def _on_voice_done(self, path):
+        self.config_section.btn_voice_only.setEnabled(True)
+        self.config_section.btn_voice_only.setText("▶ Tạo File Lồng Tiếng")
+        self.voiceover_thread = None
+        QMessageBox.information(self, "Lồng Tiếng", f"✅ Đã tạo file:\n{path}")
+        self.config_section.voice_file_path.setText(path)
+        self.config_section.chk_voice_file.setChecked(True)
+
+    def _on_voice_error(self, msg):
+        self.config_section.btn_voice_only.setEnabled(True)
+        self.config_section.btn_voice_only.setText("▶ Tạo File Lồng Tiếng")
+        self.voiceover_thread = None
+        QMessageBox.critical(self, "Lỗi Lồng Tiếng", msg)
+
+    def _preview_voice(self):
+        """Preview voice with a sample text — runs in background thread."""
+        try:
+            import edge_tts  # noqa: F401
+        except ImportError:
+            QMessageBox.warning(self, "Lỗi", "edge-tts chưa được cài đặt!")
+            return
+
+        voice_type = self.config_section.combo_voice_type.currentText()
+        from app.utils.config import VOICE_CONFIGS_EDGE_VI
+        vc = None
+        for v in VOICE_CONFIGS_EDGE_VI:
+            if v['label'] == voice_type:
+                vc = v
+                break
+        if not vc:
+            vc = VOICE_CONFIGS_EDGE_VI[0]
+
+        preview_text = "Xin chào, đây là giọng đọc thử nghiệm."
+        preview_path = os.path.join(str(BASE_DIR), 'output', '_preview.mp3')
+        os.makedirs(os.path.dirname(preview_path), exist_ok=True)
+
+        # Use user's speed setting
+        user_speed = self.config_section.voice_speed.value()
+        user_rate_pct = user_speed - 100
+        rate_str = f"{'+' if user_rate_pct >= 0 else ''}{user_rate_pct}%"
+
+        self.render_section.status_label.setText("Đang tạo preview...")
+
+        self._preview_thread = _PreviewThread(
+            vc, rate_str, preview_text, preview_path)
+        self._preview_thread.done.connect(self._on_preview_done)
+        self._preview_thread.err.connect(
+            lambda msg: self.render_section.status_label.setText(
+                f"❌ Preview: {msg}"))
+        self._preview_thread.start()
+
+    def _on_preview_done(self, path):
+        self.render_section.status_label.setText("✅ Preview sẵn sàng")
+        if os.path.exists(path):
+            self.video_player.player.setSource(QUrl.fromLocalFile(path))
+            self.video_player.play()
+
+    # ═══════════════════════════════════════════════════════
+    # Batch Render
+    # ═══════════════════════════════════════════════════════
+    def _start_batch_render(self):
+        """Batch render multiple video+SRT pairs."""
+        if not self.video_files:
+            QMessageBox.warning(self, "Lỗi", "Chưa chọn video!")
+            return
+        # Guard against duplicate batch render
+        if self.render_thread and self.render_thread.isRunning():
+            QMessageBox.warning(self, "Thông Báo", "Đang render! Vui lòng chờ.")
+            return
+
+        self.btn_batch_render.setEnabled(False)
+        self.btn_batch_render.setText("⏳ Đang batch...")
+
+        pairs, unmatched = self._match_videos_with_subtitles(self.video_files, self.srt_files)
+        if not pairs and not unmatched:
+            QMessageBox.warning(self, "Lỗi", "Không có video nào để render!")
+            return
+
+        config = self.config_section.get_config()
+        output_dir = str(BASE_DIR / 'output')
+        os.makedirs(output_dir, exist_ok=True)
+
+        # Add all to render table
+        all_items = pairs + [(v, None) for v in unmatched]
+        self.render_section.table.setRowCount(len(all_items))
+
+        for i, item in enumerate(all_items):
+            if isinstance(item, tuple) and len(item) == 2:
+                video_path, srt_path = item
+            else:
+                video_path, srt_path = item, None
+
+            base = Path(video_path).stem
+            out = os.path.join(output_dir, f"{base}_output.mp4")
+
+            self.render_section.table.setItem(i, 0, QTableWidgetItem(str(i + 1)))
+            self.render_section.table.setItem(i, 1, QTableWidgetItem(base))
+            self.render_section.table.setItem(i, 2, QTableWidgetItem(out))
+            self.render_section.table.setItem(i, 3, QTableWidgetItem("Đang chờ..."))
+
+        self._batch_queue = all_items
+        self._batch_index = 0
+        self._batch_config = config
+        self._batch_output_dir = output_dir
+        self._run_next_batch_item()
+
+    def _run_next_batch_item(self):
+        if self._batch_index >= len(self._batch_queue):
+            self.render_section.set_exporting_status(False)
+            self.render_thread = None
+            self.btn_batch_render.setEnabled(True)
+            self.btn_batch_render.setText("📦 BATCH RENDER")
+            QMessageBox.information(self, "Batch", "✅ Đã render xong tất cả video!")
+            return
+
+        item = self._batch_queue[self._batch_index]
+        video_path, srt_path = (item if isinstance(item, tuple) else (item, None))
+        base = Path(video_path).stem
+        out = os.path.join(self._batch_output_dir, f"{base}_output.mp4")
+
+        subs = []
+        if srt_path and os.path.exists(srt_path):
+            try:
+                with open(srt_path, 'r', encoding='utf-8-sig') as f:
+                    subs = parse_srt(f.read())
+            except Exception:
+                pass
+
+        from app.threads.video_creator import VideoCreatorThread
+        self.render_thread = VideoCreatorThread(
+            video_path, out, self._batch_config, subs, self._batch_output_dir,
+            self._collect_overlay_data())
+        self.render_thread.progress.connect(self._on_video_progress)
+        self.render_thread.status.connect(self._on_video_status)
+        self.render_thread.error.connect(self._on_batch_error)
+        self.render_thread.finished_video.connect(self._on_batch_item_done)
+        self.render_thread.start()
+        self.render_section.set_exporting_status(True, f"Item {self._batch_index + 1}")
+
+        # Update table
+        self.render_section.table.setItem(
+            self._batch_index, 3, QTableWidgetItem("Đang render..."))
+
+    def _on_batch_item_done(self, path):
+        self.render_section.table.setItem(
+            self._batch_index, 3, QTableWidgetItem("✅ Xong"))
+        self.render_thread = None  # Cleanup before next
+        self._batch_index += 1
+        self._run_next_batch_item()
+
+    def _on_batch_error(self, msg):
+        self.render_section.table.setItem(
+            self._batch_index, 3, QTableWidgetItem(f"❌ Lỗi"))
+        print(f"[BATCH ERROR] {msg}")
+        self._batch_index += 1
+        # If last item errored, re-enable button
+        if self._batch_index >= len(self._batch_queue):
+            self.render_thread = None
+            self.btn_batch_render.setEnabled(True)
+            self.btn_batch_render.setText("📦 BATCH RENDER")
+        self._run_next_batch_item()
+
+    def _collect_overlay_data(self):
+        """Collect overlay data from video player scene."""
+        from app.overlays import DraggableTextItem, DraggableBlurRegion
+        texts = []
+        blurs = []
+        for item in self.video_player.scene.items():
+            if isinstance(item, DraggableTextItem):
+                texts.append(item.get_data())
+            elif isinstance(item, DraggableBlurRegion):
+                blurs.append(item.get_region_data())
+        return {
+            'texts': texts,
+            'blurs': blurs,
+            'logo_path': self.config_section.logo_path.text(),
+            'preview_width': max(self.video_player.view.width(), 1),
+            'preview_height': max(self.video_player.view.height(), 1),
+        }
+

@@ -1,0 +1,32 @@
+# Python
+__pycache__/
+*.py[cod]
+*.so
+*.egg-info/
+
+# Build artifacts
+build/
+dist/
+*.spec
+
+# User data (generated at runtime)
+user_preferences.json
+api_config.json
+styles_config.json
+encoder_cache.json
+output/
+
+# Bundled binaries (downloaded separately)
+ffmpeg.exe
+ffprobe.exe
+ffmpeg
+ffprobe
+
+# IDE
+.vscode/
+.idea/
+*.swp
+
+# OS
+.DS_Store
+Thumbs.db
