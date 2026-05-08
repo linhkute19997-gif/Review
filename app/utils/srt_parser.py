@@ -131,14 +131,25 @@ def format_time_display(ms: int) -> str:
 
 
 def subtitles_to_srt(entries: List[Dict], use_translated: bool = False) -> str:
-    """Convert subtitle entries back to SRT format string."""
+    """Convert subtitle entries back to SRT format string.
+
+    ``timeline`` is the canonical ``HH:MM:SS,mmm --> HH:MM:SS,mmm``
+    string written by :func:`parse_srt`. Older project files (or
+    callers building entries by hand) may omit it; we reconstruct the
+    line from ``start`` / ``end`` so saving an SRT never KeyErrors.
+    """
     lines = []
     for i, entry in enumerate(entries, 1):
         text = entry.get('translated_text', '') if use_translated else entry.get('text', '')
         if not text:
             text = entry.get('text', '')
+        timeline = entry.get('timeline')
+        if not timeline:
+            start = entry.get('start') or '00:00:00,000'
+            end = entry.get('end') or '00:00:00,000'
+            timeline = f"{start} --> {end}"
         lines.append(f"{i}")
-        lines.append(entry['timeline'])
+        lines.append(timeline)
         lines.append(text)
         lines.append('')
     return '\n'.join(lines)

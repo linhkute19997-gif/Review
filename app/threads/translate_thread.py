@@ -447,13 +447,17 @@ class TranslateThread(QThread):
         if not batches:
             return
 
-        def _run_one(batch):
+        # Pre-compute key rotation per batch. Looking the index up via
+        # ``batches.index(batch)`` is O(n²) and — worse — returns the
+        # first match when two batches contain identical content, which
+        # collapses key rotation onto the same key.
+        key_count = max(len(self.api_keys), 1)
+
+        def _run_one(batch_index: int, batch):
             if not self._running:
                 return []
             if self.model == 'Gemini':
-                key_index = 0
-                if self.api_keys:
-                    key_index = batches.index(batch) % max(len(self.api_keys), 1)
+                key_index = batch_index % key_count if self.api_keys else 0
                 return list(_translate_batch_gemini(
                     batch, dest_name, self.api_keys, key_index))
             api_key = self.api_keys[0] if self.api_keys else ''
@@ -461,7 +465,10 @@ class TranslateThread(QThread):
 
         with ThreadPoolExecutor(
                 max_workers=max(1, min(self.max_workers, 4))) as executor:
-            futures = {executor.submit(_run_one, b): b for b in batches}
+            futures = {
+                executor.submit(_run_one, idx, b): b
+                for idx, b in enumerate(batches)
+            }
             for future in as_completed(futures):
                 if not self._running:
                     break
