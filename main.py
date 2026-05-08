@@ -3,6 +3,7 @@ Review Phim Pro — Entry Point
 """
 import sys
 import os
+import threading
 
 # Ensure the project root is in sys.path
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
@@ -16,6 +17,21 @@ from app.utils.ffmpeg_check import check_ffmpeg
 from app.utils.logger import get_logger
 
 logger = get_logger('main')
+
+
+def _prewarm_encoders():
+    """Run the encoder probe in a daemon thread.
+
+    P2-6: pay the ~1.5 s probe cost once at boot instead of on the
+    first render. The detector writes to ``encoder_cache.json`` so
+    every subsequent process boot is essentially free until the user
+    swaps GPU drivers.
+    """
+    try:
+        from app.utils.encoder_detector import EncoderDetector
+        EncoderDetector().detect_available_encoders()
+    except Exception as exc:  # noqa: BLE001 — best-effort warmup
+        logger.debug("Encoder pre-warm failed (will retry on render): %s", exc)
 
 
 def main():
@@ -36,6 +52,13 @@ def main():
     # still work even if the warm-up fails on boot.
     prewarm = PrewarmService()
     prewarm.start()
+
+    # Pre-warm the FFmpeg encoder probe so the first render doesn't
+    # pay the ~1.5 s detection cost. Runs in parallel with the main
+    # window construction, no UI dependency.
+    threading.Thread(
+        target=_prewarm_encoders, name='encoder-probe',
+        daemon=True).start()
 
     window = MainWindow(prewarm=prewarm)
     window.show()

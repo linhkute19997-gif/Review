@@ -16,8 +16,20 @@ from app.utils.logger import get_logger
 logger = get_logger('voiceover')
 
 # Cap concurrent Edge TTS requests — the public service rate-limits
-# aggressive callers, so a small pool keeps things fast without 429s.
-_EDGE_TTS_CONCURRENCY = 4
+# aggressive callers, but 8 is well within budget for the typical
+# burst (and matches Phase 2 target throughput). Per-segment retry
+# below absorbs the occasional 429.
+_EDGE_TTS_CONCURRENCY = 8
+
+# Per-segment retry policy for transient Edge TTS failures (429,
+# connection drops, etc). Backoff doubles each attempt.
+_EDGE_TTS_MAX_ATTEMPTS = 3
+_EDGE_TTS_BASE_BACKOFF_S = 0.5
+
+# Beyond this many segments a single FFmpeg amix invocation gets
+# unwieldy (long command line, slow filtergraph init). We chunk into
+# groups of this size and recursively amix the chunk outputs.
+_AMIX_CHUNK_SIZE = 32
 
 
 def _ffmpeg_executable():
@@ -145,21 +157,41 @@ class VoiceOverThread(QThread):
                 return
             out_path = os.path.join(voice_work_dir, f"voice_{i:04d}.mp3")
             async with sem:
-                if not self._running:
-                    return
-                try:
-                    communicate = edge_tts.Communicate(
-                        sub['text'], voice_choice['voice'],
-                        pitch=pitch, rate=rate_str)
-                    await communicate.save(out_path)
-                    if os.path.exists(out_path):
-                        results[i] = {
-                            'audio_path': out_path,
-                            'start_ms': sub['start_ms'],
-                            'end_ms': sub['end_ms'],
-                        }
-                except Exception as exc:
-                    logger.debug("Edge TTS error for segment %s: %s", i, exc)
+                last_exc = None
+                for attempt in range(_EDGE_TTS_MAX_ATTEMPTS):
+                    if not self._running:
+                        return
+                    try:
+                        communicate = edge_tts.Communicate(
+                            sub['text'], voice_choice['voice'],
+                            pitch=pitch, rate=rate_str)
+                        await communicate.save(out_path)
+                        if os.path.exists(out_path) and os.path.getsize(out_path) > 0:
+                            results[i] = {
+                                'audio_path': out_path,
+                                'start_ms': sub['start_ms'],
+                                'end_ms': sub['end_ms'],
+                            }
+                            last_exc = None
+                            break
+                    except Exception as exc:
+                        last_exc = exc
+                        # Edge TTS surfaces 429s as ``ClientResponseError``
+                        # but the message also helps us identify them.
+                        msg = str(exc).lower()
+                        is_transient = (
+                            '429' in msg or 'timeout' in msg
+                            or 'connection' in msg or 'reset' in msg)
+                        if not is_transient and attempt == 0:
+                            # Permanent failure (auth, bad voice id, …).
+                            break
+                        if attempt < _EDGE_TTS_MAX_ATTEMPTS - 1:
+                            await asyncio.sleep(
+                                _EDGE_TTS_BASE_BACKOFF_S * (2 ** attempt))
+                if last_exc is not None:
+                    logger.debug(
+                        "Edge TTS error for segment %s after %d attempts: %s",
+                        i, _EDGE_TTS_MAX_ATTEMPTS, last_exc)
             completed[0] += 1
             self.progress.emit(f"Edge TTS: {completed[0]}/{total}")
 
@@ -218,94 +250,214 @@ class VoiceOverThread(QThread):
 
         return segments
 
-    def _apply_atempo_inplace(self, mp3_path, factor):
-        """Re-encode mp3_path with FFmpeg atempo (preserves pitch).
+    def _apply_atempo_to_wav(self, src_path, factor):
+        """Apply FFmpeg ``atempo`` and write a 16-bit PCM WAV next to src.
 
-        Falls back to a no-op if FFmpeg isn't available.
+        WAV intermediate (P2-8) avoids the double MP3 encode that the
+        previous implementation paid: it decoded MP3 → applied atempo
+        → re-encoded MP3, only for the merge step to decode it again.
+        WAV output here is a single decode-and-resample, then the
+        amix step writes one final MP3 at the end.
+
+        Returns the new path on success, or None if FFmpeg isn't
+        available / the conversion fails (caller falls back to src).
         """
         chain = _atempo_chain(factor)
         if not chain:
-            return
+            return None
         ffmpeg = _ffmpeg_executable()
-        tmp_out = mp3_path + '.atempo.mp3'
-        cmd = [ffmpeg, '-y', '-loglevel', 'error', '-i', mp3_path,
-               '-filter:a', chain, '-c:a', 'libmp3lame', '-q:a', '4', tmp_out]
+        wav_path = os.path.splitext(src_path)[0] + '.wav'
+        cmd = [
+            ffmpeg, '-y', '-loglevel', 'error', '-i', src_path,
+            '-filter:a', chain,
+            '-ac', '2', '-ar', '44100', '-c:a', 'pcm_s16le', wav_path,
+        ]
         try:
             subprocess.run(
                 cmd, check=True,
                 creationflags=getattr(subprocess, 'CREATE_NO_WINDOW', 0))
-            os.replace(tmp_out, mp3_path)
+            return wav_path
         except Exception as exc:
-            logger.debug("atempo failed for %s: %s", mp3_path, exc)
-            if os.path.exists(tmp_out):
+            logger.debug("atempo failed for %s: %s", src_path, exc)
+            if os.path.exists(wav_path):
                 try:
-                    os.remove(tmp_out)
+                    os.remove(wav_path)
                 except OSError:
                     pass
+            return None
+
+    def _probe_duration_ms(self, path):
+        """Return media duration in ms via ffprobe, or None on failure."""
+        ffmpeg = _ffmpeg_executable()
+        # ffprobe lives next to ffmpeg.
+        ffprobe = ffmpeg
+        if ffmpeg.lower().endswith('ffmpeg.exe'):
+            ffprobe = ffmpeg[:-10] + 'ffprobe.exe'
+        elif ffmpeg.lower().endswith('ffmpeg'):
+            ffprobe = ffmpeg[:-6] + 'ffprobe'
+        cmd = [ffprobe, '-v', 'error', '-show_entries',
+               'format=duration', '-of', 'default=nw=1:nk=1', path]
+        try:
+            res = subprocess.run(
+                cmd, check=True, capture_output=True, timeout=15,
+                creationflags=getattr(subprocess, 'CREATE_NO_WINDOW', 0))
+            return int(float(res.stdout.decode('utf-8', 'ignore').strip()) * 1000)
+        except Exception as exc:
+            logger.debug("ffprobe failed for %s: %s", path, exc)
+            return None
 
     def _merge_segments(self, segments, output_dir):
-        """Merge voice segments onto a pre-allocated silent timeline.
+        """Merge voice segments via FFmpeg ``adelay``+``amix``.
 
-        Two upgrades over the previous implementation:
+        Phase 2 upgrade: replaces pydub's Python-level mixing (which
+        loads every clip into memory and overlays in user-space) with
+        a single FFmpeg invocation that applies per-segment
+        ``adelay`` and mixes all streams. This is O(total audio) at
+        FFmpeg speed instead of O(n × clip-length) at Python speed.
 
-        1. ``combined += seg`` is O(n²) because pydub copies the whole
-           buffer on every concat. We instead allocate one silent
-           buffer of the final length and ``overlay`` each segment at
-           its own ``start_ms`` — O(total audio length).
-        2. If ``fit_to_subtitle`` is on (default), we squash/stretch any
-           segment that exceeds its slot via FFmpeg ``atempo`` so the
-           rendered voice stays aligned with the subtitle track.
+        For very large segment counts we chunk to keep the filtergraph
+        manageable: groups of ``_AMIX_CHUNK_SIZE`` are mixed to
+        intermediate WAVs, then those WAVs are mixed to the final MP3.
+        """
+        if not segments:
+            return None
+
+        ffmpeg = _ffmpeg_executable()
+        final_path = os.path.join(output_dir, 'voiceover_output.mp3')
+        segments.sort(key=lambda s: s['start_ms'])
+
+        # Optionally fit each segment to its subtitle slot before merge.
+        # Using WAV intermediate avoids re-encoding to MP3 only to
+        # decode again in the next step.
+        prepared: list[tuple[int, str]] = []  # (start_ms, audio_path)
+        for seg in segments:
+            audio_path = seg['audio_path']
+            slot_ms = max(seg['end_ms'] - seg['start_ms'], 1)
+            if self.fit_to_subtitle:
+                dur_ms = self._probe_duration_ms(audio_path)
+                if dur_ms is not None and dur_ms > slot_ms * 1.05:
+                    factor = dur_ms / slot_ms
+                    wav = self._apply_atempo_to_wav(audio_path, factor)
+                    if wav:
+                        audio_path = wav
+            prepared.append((seg['start_ms'], audio_path))
+
+        if not prepared:
+            return None
+
+        # If the segment count is small enough, mix in one shot.
+        if len(prepared) <= _AMIX_CHUNK_SIZE:
+            return self._amix_to_file(
+                prepared, final_path, output_format='mp3', is_final=True,
+                ffmpeg=ffmpeg)
+
+        # Otherwise mix chunks to intermediate WAVs, then mix those.
+        chunk_dir = os.path.join(output_dir, '_voice_chunks')
+        os.makedirs(chunk_dir, exist_ok=True)
+        chunk_outputs: list[tuple[int, str]] = []
+        for i in range(0, len(prepared), _AMIX_CHUNK_SIZE):
+            chunk = prepared[i:i + _AMIX_CHUNK_SIZE]
+            chunk_path = os.path.join(chunk_dir, f"chunk_{i:05d}.wav")
+            ok = self._amix_to_file(
+                chunk, chunk_path, output_format='wav', is_final=False,
+                ffmpeg=ffmpeg)
+            if not ok:
+                logger.warning("amix chunk %d failed, skipping", i)
+                continue
+            # Each chunk preserves the first segment's absolute offset.
+            chunk_outputs.append((chunk[0][0], chunk_path))
+        if not chunk_outputs:
+            return None
+        # Recompute relative offsets so each chunk lands at its own
+        # absolute timestamp on the final timeline.
+        result = self._amix_to_file(
+            chunk_outputs, final_path, output_format='mp3',
+            is_final=True, ffmpeg=ffmpeg)
+        # Best-effort cleanup of intermediate chunks.
+        try:
+            for _, p in chunk_outputs:
+                if os.path.exists(p):
+                    os.remove(p)
+            os.rmdir(chunk_dir)
+        except OSError:
+            pass
+        return result
+
+    def _amix_to_file(self, items, out_path, output_format,
+                      is_final, ffmpeg):
+        """Build an FFmpeg amix command for ``items`` and run it.
+
+        ``items`` is a list of ``(start_ms, audio_path)``. The earliest
+        start is rebased to 0 so amix only sees relative offsets.
+        """
+        if not items:
+            return None
+        base = items[0][0]
+        cmd = [ffmpeg, '-y', '-loglevel', 'error']
+        for _, path in items:
+            cmd.extend(['-i', path])
+        # Build filtergraph: [0:a]adelay=...|...[a0]; ... ; amix → out.
+        filter_parts = []
+        labels = []
+        for idx, (start_ms, _) in enumerate(items):
+            delay_ms = max(0, start_ms - base)
+            label = f"a{idx}"
+            # Apply delay to both channels so stereo doesn't desync.
+            filter_parts.append(
+                f"[{idx}:a]adelay={delay_ms}|{delay_ms}[{label}]")
+            labels.append(f"[{label}]")
+        filter_parts.append(
+            f"{''.join(labels)}amix=inputs={len(items)}:"
+            "duration=longest:dropout_transition=0,"
+            "volume=1.0[out]")
+        cmd.extend(['-filter_complex', ';'.join(filter_parts),
+                    '-map', '[out]'])
+        if output_format == 'mp3':
+            cmd.extend(['-c:a', 'libmp3lame', '-q:a', '4'])
+        else:
+            cmd.extend(['-ac', '2', '-ar', '44100', '-c:a', 'pcm_s16le'])
+        cmd.append(out_path)
+        try:
+            subprocess.run(
+                cmd, check=True,
+                creationflags=getattr(subprocess, 'CREATE_NO_WINDOW', 0))
+        except Exception as exc:  # noqa: BLE001
+            logger.warning("FFmpeg amix failed (%s) — falling back to pydub", exc)
+            if is_final:
+                return self._merge_with_pydub_fallback(items, out_path)
+            return None
+        if is_final:
+            logger.debug("Merged voice via amix: %s (%d segments)",
+                         out_path, len(items))
+        return out_path
+
+    def _merge_with_pydub_fallback(self, items, out_path):
+        """Last-resort merge if FFmpeg amix fails on this system.
+
+        Kept as a safety net so a broken FFmpeg filter chain doesn't
+        block the user — they get the slower pydub path instead.
         """
         try:
             from pydub import AudioSegment
         except ImportError:
             self.error.emit("pydub chưa được cài đặt!")
             return None
-
-        if not segments:
-            return None
-
-        final_path = os.path.join(output_dir, 'voiceover_output.mp3')
-        segments.sort(key=lambda s: s['start_ms'])
-
-        # Optionally fit each segment to its subtitle slot before merge.
-        if self.fit_to_subtitle:
-            for seg in segments:
-                slot_ms = max(seg['end_ms'] - seg['start_ms'], 1)
-                try:
-                    audio = AudioSegment.from_mp3(seg['audio_path'])
-                except Exception as exc:
-                    logger.debug("cannot probe %s: %s", seg['audio_path'], exc)
-                    continue
-                # Only compress overflow — don't pad short clips with atempo
-                # since silence at the end keeps the voice natural.
-                if len(audio) > slot_ms * 1.05:
-                    factor = len(audio) / slot_ms
-                    self._apply_atempo_inplace(seg['audio_path'], factor)
-
-        # Determine final duration: max(end_ms) plus a small tail.
         loaded = []
-        for seg in segments:
+        for start_ms, path in items:
             try:
-                audio = AudioSegment.from_mp3(seg['audio_path'])
-            except Exception as exc:
-                logger.debug("Error loading segment: %s", exc)
+                audio = AudioSegment.from_file(path)
+            except Exception as exc:  # noqa: BLE001
+                logger.debug("pydub fallback skip %s: %s", path, exc)
                 continue
-            loaded.append((seg['start_ms'], audio))
-
+            loaded.append((start_ms, audio))
         if not loaded:
             return None
-
-        timeline_ms = max(start + len(a) for start, a in loaded)
-        # Add a 200ms tail so the last word isn't clipped.
-        timeline_ms += 200
+        timeline_ms = max(s + len(a) for s, a in loaded) + 200
         combined = AudioSegment.silent(duration=timeline_ms)
-        for start_ms, audio in loaded:
-            combined = combined.overlay(audio, position=max(0, start_ms))
-
-        combined.export(final_path, format='mp3')
-        logger.debug("Merged voice: %s (%dms)", final_path, len(combined))
-        return final_path
+        for s, a in loaded:
+            combined = combined.overlay(a, position=max(0, s))
+        combined.export(out_path, format='mp3')
+        return out_path
 
     def _parse_srt_time(self, time_str):
         """Parse SRT time format (HH:MM:SS,mmm) to milliseconds."""
