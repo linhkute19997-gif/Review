@@ -279,8 +279,9 @@ Format: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text
         h, m, s = hms.split(':')
         return f"{int(h)}:{m}:{s}.{cs}"
 
-    def _check_disk_space(self) -> bool:
-        """Validate that enough free space exists in the output directory.
+    def _check_disk_space(self, extra_dirs: list | None = None) -> bool:
+        """Validate that enough free space exists in the output directory
+        **and** any additional directories (e.g. the temp/scratch dir).
 
         Emits ``self.error`` and returns ``False`` when the available
         free space is below ``input_size * _DISK_SAFETY_FACTOR`` or
@@ -294,19 +295,25 @@ Format: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text
             input_size = 0
         required = max(int(input_size * _DISK_SAFETY_FACTOR),
                        _DISK_MIN_FREE_BYTES)
-        try:
-            usage = shutil.disk_usage(self.output_dir or '.')
-        except OSError as exc:
-            logger.warning("Could not check disk usage: %s", exc)
-            return True  # fail-open rather than blocking the user
-        if usage.free < required:
-            free_mb = usage.free / (1024 * 1024)
-            need_mb = required / (1024 * 1024)
-            self.error.emit(
-                "❌ Không đủ dung lượng đĩa: cần ~%d MB, còn %d MB. "
-                "Hãy giải phóng dung lượng và thử lại."
-                % (int(need_mb), int(free_mb)))
-            return False
+        dirs_to_check = [self.output_dir or '.']
+        for d in (extra_dirs or []):
+            if d and d not in dirs_to_check:
+                dirs_to_check.append(d)
+        for check_dir in dirs_to_check:
+            try:
+                usage = shutil.disk_usage(check_dir)
+            except OSError as exc:
+                logger.warning("Could not check disk usage for %s: %s",
+                               check_dir, exc)
+                continue  # fail-open rather than blocking the user
+            if usage.free < required:
+                free_mb = usage.free / (1024 * 1024)
+                need_mb = required / (1024 * 1024)
+                self.error.emit(
+                    "❌ Không đủ dung lượng đĩa (%s): cần ~%d MB, còn %d MB. "
+                    "Hãy giải phóng dung lượng và thử lại."
+                    % (check_dir, int(need_mb), int(free_mb)))
+                return False
         return True
 
     def run(self):
@@ -315,7 +322,7 @@ Format: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text
         temp_dir = tempfile.mkdtemp(prefix='rpp-render-')
         logger.debug("Render scratch dir: %s", temp_dir)
         try:
-            if not self._check_disk_space():
+            if not self._check_disk_space(extra_dirs=[temp_dir]):
                 return
 
             self.status.emit("Đang chuẩn bị...")
