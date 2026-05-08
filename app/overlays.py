@@ -1,13 +1,17 @@
 """
-Overlay System — Draggable text, blur regions, and logo on video preview.
+Overlay System — Draggable text and blur regions on video preview.
+
+Logos are rendered through ``ConfigSection`` + FFmpeg ``overlay`` filter,
+not as draggable scene items. The legacy ``DraggableLogo`` class was
+unused and has been removed.
 """
 from PyQt6.QtWidgets import (
-    QGraphicsRectItem, QGraphicsTextItem, QGraphicsPixmapItem,
-    QGraphicsItem, QMenu, QColorDialog, QInputDialog
+    QGraphicsRectItem, QGraphicsItem, QMenu,
+    QColorDialog, QInputDialog,
 )
-from PyQt6.QtCore import Qt, QRectF, QPointF
+from PyQt6.QtCore import Qt, QRectF
 from PyQt6.QtGui import (
-    QFont, QPixmap, QPainter, QColor, QBrush, QPen, QCursor
+    QFont, QColor, QBrush, QPen,
 )
 
 
@@ -240,38 +244,6 @@ class DraggableBlurRegion(SelectableOverlayItem):
             'height': self.rect().height(),
             'strength': self.blur_strength,
         }
-
-
-class DraggableLogo(QGraphicsPixmapItem):
-    """Logo image overlay, draggable with context menu."""
-
-    def __init__(self, pixmap, x=0, y=0, parent=None):
-        super().__init__(pixmap, parent)
-        self.setPos(x, y)
-        self.setFlags(
-            QGraphicsItem.GraphicsItemFlag.ItemIsMovable |
-            QGraphicsItem.GraphicsItemFlag.ItemIsSelectable
-        )
-
-    def mousePressEvent(self, event):
-        super().mousePressEvent(event)
-
-    def mouseMoveEvent(self, event):
-        super().mouseMoveEvent(event)
-
-    def mouseReleaseEvent(self, event):
-        super().mouseReleaseEvent(event)
-
-    def _show_context_menu(self, event):
-        menu = QMenu()
-        delete_action = menu.addAction("🗑 Xóa Logo")
-        action = menu.exec(event.screenPos())
-        if action == delete_action:
-            if self.scene():
-                self.scene().removeItem(self)
-
-    def contextMenuEvent(self, event):
-        self._show_context_menu(event)
 
 
 class AddTextDialog:

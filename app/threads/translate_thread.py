@@ -1,9 +1,94 @@
 """
 Translation Engine — 4 backends: Google, Gemini, Baidu, ChatGPT
 """
+import threading
+import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from PyQt6.QtCore import QThread, pyqtSignal
-from typing import List, Dict
+
+from app.utils.logger import get_logger
+
+logger = get_logger('translate')
+
+# ── Network policy ────────────────────────────────────────────
+# Tuple is ``(connect_timeout, read_timeout)``. We keep connect tight
+# (5 s) so a dead host fails fast, and the read budget at 30 s so the
+# longest LLM responses still complete on a slow uplink.
+HTTP_TIMEOUT = (5, 30)
+
+# Max retries for transient HTTP failures (5xx, ConnectionError, ReadTimeout).
+HTTP_MAX_RETRIES = 3
+
+
+# ── Token bucket rate limiter ─────────────────────────────────
+# Google's free Translate endpoint will start returning 429 once you
+# push past ~10 requests/sec sustained. We share a single token bucket
+# across *all* worker threads in a TranslateThread so the 4-thread
+# default cannot overshoot.
+class _TokenBucket:
+    """Thread-safe token bucket."""
+
+    def __init__(self, rate_per_sec: float, capacity: float | None = None):
+        self.rate = float(rate_per_sec)
+        self.capacity = float(capacity if capacity is not None else max(rate_per_sec, 1.0))
+        self._tokens = self.capacity
+        self._last = time.monotonic()
+        self._lock = threading.Lock()
+
+    def acquire(self, cost: float = 1.0) -> None:
+        if self.rate <= 0:
+            return
+        while True:
+            with self._lock:
+                now = time.monotonic()
+                self._tokens = min(
+                    self.capacity, self._tokens + (now - self._last) * self.rate)
+                self._last = now
+                if self._tokens >= cost:
+                    self._tokens -= cost
+                    return
+                wait = (cost - self._tokens) / self.rate
+            time.sleep(min(wait, 1.0))
+
+
+# Per-process rate limit for the public Google endpoint. Picked
+# conservatively below the 10 RPS soft cap.
+_GOOGLE_BUCKET = _TokenBucket(rate_per_sec=8.0, capacity=8.0)
+
+
+def _post_with_retry(url, *, params=None, json=None, headers=None,
+                     max_retries=HTTP_MAX_RETRIES):
+    """POST with bounded retries on transient errors. Returns the parsed JSON.
+
+    A non-JSON or non-2xx response with a ``5xx`` code is retried up to
+    ``max_retries`` times with exponential backoff (0.5, 1.0, 2.0 s).
+    Any other error bubbles up to the caller.
+    """
+    import requests
+
+    last_exc = None
+    for attempt in range(max_retries):
+        try:
+            resp = requests.post(
+                url, params=params, json=json, headers=headers,
+                timeout=HTTP_TIMEOUT)
+            if resp.status_code >= 500:
+                logger.warning(
+                    "%s returned %s (attempt %d)", url, resp.status_code, attempt + 1)
+                last_exc = RuntimeError(
+                    f"HTTP {resp.status_code}: {resp.text[:200]}")
+            else:
+                try:
+                    return resp.json()
+                except ValueError as exc:
+                    last_exc = exc
+                    logger.warning("%s returned non-JSON: %s", url, exc)
+        except (requests.ConnectionError, requests.Timeout) as exc:
+            last_exc = exc
+            logger.warning(
+                "%s transient failure (attempt %d): %s", url, attempt + 1, exc)
+        time.sleep(0.5 * (2 ** attempt))
+    raise last_exc if last_exc else RuntimeError(f"POST {url} failed")
 
 
 def translate_single(args):
@@ -39,6 +124,7 @@ def translate_single(args):
                         'es': 'es', 'pt': 'pt', 'id': 'id'}
             final_dest = lang_map.get(dest_lang, dest_lang)
             final_src = lang_map.get(src_lang, 'auto')
+            _GOOGLE_BUCKET.acquire()
             translator = GoogleTranslator(source=final_src, target=final_dest)
             translated_text = translator.translate(text)
             return index, translated_text
@@ -60,52 +146,72 @@ def translate_single(args):
                 except Exception as e:
                     error_msg = str(e).lower()
                     if '429' in error_msg or 'quota' in error_msg or 'exceeded' in error_msg:
-                        print(f"[DEBUG] API key {idx} bị block (429): {e}")
+                        logger.debug("API key %s blocked (429): %s", idx, e)
                         continue
                     return index, f'[Lỗi Gemini: {e}]'
             return index, '[Lỗi: Tất cả API key Gemini đều bị block]'
 
         elif model == 'Baidu':
-            import requests, hashlib, random
+            import hashlib
+            import random
             if not api_keys or '|' not in str(api_keys):
                 return index, '[Lỗi: API key Baidu cần format: appid|secretkey]'
             parts = str(api_keys).split('|')
             appid, secret_key = parts[0], parts[1]
             salt = str(random.randint(32768, 65536))
-            sign = hashlib.md5((appid + text + salt + secret_key).encode()).hexdigest()
+            sign = hashlib.md5(
+                (appid + text + salt + secret_key).encode()).hexdigest()
             final_src = 'auto' if src_lang == 'auto' else src_lang.replace('-', '')
             final_dest = 'vie' if dest_lang == 'vi' else dest_lang.replace('-', '')
             params = {'q': text, 'from': final_src, 'to': final_dest,
                       'appid': appid, 'salt': salt, 'sign': sign}
-            result = requests.post('https://api.fanyi.baidu.com/api/trans/vip/translate',
-                                   params=params).json()
+            try:
+                result = _post_with_retry(
+                    'https://api.fanyi.baidu.com/api/trans/vip/translate',
+                    params=params)
+            except Exception as exc:
+                return index, f'[Lỗi Baidu mạng: {exc}]'
+            if not isinstance(result, dict):
+                return index, '[Lỗi Baidu: phản hồi không hợp lệ]'
             if 'error_code' in result:
                 return index, f"[Lỗi Baidu: {result.get('error_msg', 'Unknown')}]"
             return index, result.get('trans_result', [{}])[0].get('dst', text)
 
         elif model == 'ChatGPT':
-            import requests
             if not api_keys:
                 return index, '[Lỗi: Không có API key]'
-            headers = {'Authorization': f'Bearer {api_keys}', 'Content-Type': 'application/json'}
+            headers = {
+                'Authorization': f'Bearer {api_keys}',
+                'Content-Type': 'application/json',
+            }
             data = {
                 'model': 'gpt-3.5-turbo',
                 'messages': [
                     {'role': 'system', 'content': f'Bạn là dịch giả. Dịch sang {dest_name}. Chỉ trả về bản dịch.'},
-                    {'role': 'user', 'content': text}
+                    {'role': 'user', 'content': text},
                 ],
-                'temperature': 0.3
+                'temperature': 0.3,
             }
-            result = requests.post('https://api.openai.com/v1/chat/completions',
-                                   headers=headers, json=data).json()
+            try:
+                result = _post_with_retry(
+                    'https://api.openai.com/v1/chat/completions',
+                    headers=headers, json=data)
+            except Exception as exc:
+                return index, f'[Lỗi ChatGPT mạng: {exc}]'
+            if not isinstance(result, dict):
+                return index, '[Lỗi ChatGPT: phản hồi không hợp lệ]'
             if 'error' in result:
                 return index, f"[Lỗi ChatGPT: {result['error'].get('message', 'Unknown')}]"
-            return index, result['choices'][0]['message']['content'].strip()
+            try:
+                return index, result['choices'][0]['message']['content'].strip()
+            except (KeyError, IndexError, TypeError):
+                return index, '[Lỗi ChatGPT: phản hồi không có choices]'
 
         else:
             return index, f'[Mô hình không hỗ trợ: {model}]'
 
     except Exception as e:
+        logger.exception("translate_single failed for index=%s: %s", index, e)
         return index, f'[Lỗi: {e}]'
 
 

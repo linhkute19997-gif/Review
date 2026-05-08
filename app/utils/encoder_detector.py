@@ -1,12 +1,14 @@
 """
 Encoder Detector — Detect available GPU/CPU encoders for FFmpeg.
 """
-import subprocess
-import json
 import os
-import sys
-from pathlib import Path
-from app.utils.config import FFMPEG_PATH, BASE_DIR
+import subprocess
+
+from app.utils.atomic_io import atomic_write_json, read_json
+from app.utils.config import BASE_DIR, FFMPEG_PATH
+from app.utils.logger import get_logger
+
+logger = get_logger('encoder_detector')
 
 
 class EncoderDetector:
@@ -38,22 +40,18 @@ class EncoderDetector:
         if self._cache is not None:
             return self._cache
 
-        # Try to load from cache file
-        if os.path.exists(self.CACHE_FILE):
-            try:
-                with open(self.CACHE_FILE, 'r') as f:
-                    self._cache = json.load(f)
-                return self._cache
-            except Exception:
-                pass
+        cached = read_json(self.CACHE_FILE, None)
+        if isinstance(cached, list):
+            self._cache = cached
+            return self._cache
 
         available = []
         for enc_name, enc_desc in self.ALL_ENCODERS:
             if self._test_encoder(enc_name):
                 available.append({'name': enc_name, 'description': enc_desc})
-                print(f"[DEBUG] ✓ Encoder available: {enc_desc}")
+                logger.debug("Encoder available: %s", enc_desc)
             else:
-                print(f"[DEBUG] ✗ Encoder not available: {enc_desc}")
+                logger.debug("Encoder unavailable: %s", enc_desc)
 
         self._cache = available
         self._save_cache(available)
@@ -77,10 +75,9 @@ class EncoderDetector:
 
     def _save_cache(self, available):
         try:
-            with open(self.CACHE_FILE, 'w') as f:
-                json.dump(available, f, indent=2)
-        except Exception:
-            pass
+            atomic_write_json(self.CACHE_FILE, available)
+        except Exception as exc:
+            logger.warning("Could not persist encoder cache: %s", exc)
 
     def clear_cache(self):
         self._cache = None

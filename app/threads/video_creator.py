@@ -2,11 +2,23 @@
 Video Creator Thread — FFmpeg rendering pipeline
 """
 import os
+import shutil
 import subprocess
-import traceback
+import tempfile
 import threading
+
 from PyQt6.QtCore import QThread, pyqtSignal
+
 from app.utils.config import FFMPEG_PATH, FFPROBE_PATH
+from app.utils.logger import get_logger
+
+logger = get_logger('video_creator')
+
+# Output is always ≤ input duration so 1× input size is plenty for the
+# encoded result; 50% buffer covers temp ASS, indices and any inline
+# transcoding that decodes the original container.
+_DISK_SAFETY_FACTOR = 1.5
+_DISK_MIN_FREE_BYTES = 256 * 1024 * 1024  # 256 MB minimum cushion
 
 
 class VideoCreatorThread(QThread):
@@ -202,8 +214,45 @@ Format: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text
         h, m, s = hms.split(':')
         return f"{int(h)}:{m}:{s}.{cs}"
 
-    def run(self):
+    def _check_disk_space(self) -> bool:
+        """Validate that enough free space exists in the output directory.
+
+        Emits ``self.error`` and returns ``False`` when the available
+        free space is below ``input_size * _DISK_SAFETY_FACTOR`` or
+        ``_DISK_MIN_FREE_BYTES``, whichever is larger.
+        """
         try:
+            input_size = os.path.getsize(self.input_video)
+        except OSError as exc:
+            logger.warning("Could not stat input video %s: %s",
+                           self.input_video, exc)
+            input_size = 0
+        required = max(int(input_size * _DISK_SAFETY_FACTOR),
+                       _DISK_MIN_FREE_BYTES)
+        try:
+            usage = shutil.disk_usage(self.output_dir or '.')
+        except OSError as exc:
+            logger.warning("Could not check disk usage: %s", exc)
+            return True  # fail-open rather than blocking the user
+        if usage.free < required:
+            free_mb = usage.free / (1024 * 1024)
+            need_mb = required / (1024 * 1024)
+            self.error.emit(
+                "❌ Không đủ dung lượng đĩa: cần ~%d MB, còn %d MB. "
+                "Hãy giải phóng dung lượng và thử lại."
+                % (int(need_mb), int(free_mb)))
+            return False
+        return True
+
+    def run(self):
+        # Per-job scratch dir keeps ASS / temp files unique even when
+        # multiple renders share an output_dir (batch mode).
+        temp_dir = tempfile.mkdtemp(prefix='rpp-render-')
+        logger.debug("Render scratch dir: %s", temp_dir)
+        try:
+            if not self._check_disk_space():
+                return
+
             self.status.emit("Đang chuẩn bị...")
             self.progress.emit(5)
 
@@ -277,7 +326,7 @@ Format: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text
             ass_path = None
             if self.subtitles and config.get('text_subtitle_enabled', True):
                 self.status.emit("Tạo phụ đề ASS...")
-                ass_path = os.path.join(self.output_dir, '_temp_subtitle.ass')
+                ass_path = os.path.join(temp_dir, 'subtitle.ass')
                 self._generate_ass_subtitle(self.subtitles, config, ass_path)
                 # Escape path for FFmpeg (Windows backslash → forward slash, escape colon)
                 ass_escaped = ass_path.replace('\\', '/').replace(':', '\\:')
@@ -509,25 +558,18 @@ Format: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text
                         success = True
                         break
                     elif rc == -1:
-                        print(f"[DEBUG] {enc_desc} timeout")
+                        logger.debug("%s timeout", enc_desc)
                     else:
                         err = stderr.decode('utf-8', errors='ignore').lower()
-                        print(f"[DEBUG] {enc_desc} lỗi: {err[:300]}")
+                        logger.debug("%s failed: %s", enc_desc, err[:300])
                 except Exception as e:
-                    print(f"[DEBUG] {enc_desc} exception: {e}")
+                    logger.debug("%s exception: %s", enc_desc, e)
 
             if not success:
                 self.error.emit("❌ Không thể render video với bất kỳ codec nào!")
                 return
 
             self.progress.emit(90)
-
-            # ── Cleanup temp files ──
-            if ass_path and os.path.exists(ass_path):
-                try:
-                    os.remove(ass_path)
-                except Exception:
-                    pass
 
             # ── Signal completion ──
             if os.path.exists(self.output_video):
@@ -538,8 +580,10 @@ Format: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text
                 self.error.emit("Video output file not found!")
 
         except Exception as e:
-            traceback.print_exc()
+            logger.exception("VideoCreator failed: %s", e)
             self.error.emit(f"Lỗi: {e}")
+        finally:
+            shutil.rmtree(temp_dir, ignore_errors=True)
 
     def stop(self):
         self._running = False

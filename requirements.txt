@@ -1,34 +1,46 @@
-# Review Phim Pro — Dependencies
-# Core
-PyQt6>=6.6.0
-PyQt6-Qt6>=6.6.0
-PyQt6-sip>=13.6.0
-PyQt6-WebEngine>=6.6.0
+# Review Phim Pro — Runtime Dependencies
+#
+# We use the compatible-release operator ``~=`` so patch upgrades land
+# automatically (security fixes) while major / minor bumps that may
+# break behaviour stay opt-in. Tooling lives in ``requirements-dev.txt``.
 
-# Translation
-deep-translator>=1.11.0
-google-generativeai>=0.5.0
-requests>=2.31.0
+# ── Core UI ────────────────────────────────────────────────
+PyQt6~=6.6
+PyQt6-Qt6~=6.6
+PyQt6-sip~=13.6
+PyQt6-WebEngine~=6.6
 
-# Video downloader (Douyin / TikTok)
-yt-dlp>=2024.7.1
+# ── Translation backends ──────────────────────────────────
+deep-translator~=1.11
+google-generativeai~=0.5
+requests~=2.31
 
-# Voice
-edge-tts>=6.1.0
-gTTS>=2.5.0
-pydub>=0.25.1
-elevenlabs>=1.0.0
+# ── Video downloader (Douyin / TikTok) ────────────────────
+yt-dlp~=2024.7
 
-# Video
-opencv-python>=4.9.0
-moviepy>=1.0.3
+# ── Voice / audio ─────────────────────────────────────────
+edge-tts~=6.1
+gTTS~=2.5
+pydub~=0.25
+elevenlabs~=1.0
 
-# Subtitle Extraction
+# ── Video / image ─────────────────────────────────────────
+opencv-python~=4.9
+moviepy~=1.0
+
+# ── Subtitle extraction ───────────────────────────────────
 openai-whisper>=20231117
 
-# OCR (optional — requires paddlepaddle)
-# paddleocr>=2.7.0
-# paddlepaddle>=2.6.0
+# ── ML runtime ────────────────────────────────────────────
+torch~=2.2
 
-# AI
-torch>=2.2.0
+# ── Reliability / hardening ───────────────────────────────
+# Cross-process JSON write coordination (atomic_io's fallback is in-process only).
+filelock~=3.13
+# OS keychain backend for the API-key vault (keyring + cryptography keep secrets off disk).
+keyring~=24.0
+cryptography~=42.0
+
+# ── OCR (optional — install only if you need PaddleOCR) ───
+# paddleocr~=2.7
+# paddlepaddle~=2.6
