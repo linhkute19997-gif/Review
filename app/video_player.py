@@ -13,7 +13,7 @@ from PyQt6.QtGui import QPainter
 from PyQt6.QtMultimedia import QMediaPlayer, QAudioOutput
 from PyQt6.QtMultimediaWidgets import QGraphicsVideoItem
 
-from app.utils.srt_parser import format_time_display
+from app.utils.srt_parser import format_time_display, parse_srt_time_to_ms
 
 
 class VideoPlayerSection(QWidget):
@@ -204,11 +204,43 @@ class VideoPlayerSection(QWidget):
     def set_subtitle_entries(self, entries: list) -> None:
         """Feed the editor's subtitle list into the player overlay.
 
-        ``entries`` is the same shape as the SRT model (start/end in
-        milliseconds, ``translated_text`` preferred, falling back to
-        ``text``). Calling this with an empty list clears the overlay.
+        Accepts entries in either format:
+
+        * the SRT-parser shape: ``{'start': 'HH:MM:SS,mmm',
+          'end': 'HH:MM:SS,mmm', ...}`` (default for ``parse_srt``).
+        * the legacy millisecond shape: ``{'start_time': int,
+          'end_time': int, ...}``.
+
+        We normalise every entry to carry ``start_time`` / ``end_time``
+        in milliseconds so :meth:`_refresh_live_subtitle` does not need
+        to know which producer fed the list. ``translated_text`` is
+        preferred for display, falling back to ``text``.
         """
-        self._subtitle_entries = entries or []
+        normalised: list = []
+        for entry in entries or []:
+            if not isinstance(entry, dict):
+                continue
+            start_ms = entry.get('start_time')
+            end_ms = entry.get('end_time')
+            if start_ms is None and 'start' in entry:
+                try:
+                    start_ms = parse_srt_time_to_ms(str(entry['start']))
+                except (ValueError, TypeError, AttributeError):
+                    start_ms = 0
+            if end_ms is None and 'end' in entry:
+                try:
+                    end_ms = parse_srt_time_to_ms(str(entry['end']))
+                except (ValueError, TypeError, AttributeError):
+                    end_ms = 0
+            # Keep the original entry intact (other consumers still
+            # need ``start`` / ``end`` strings) but augment with the
+            # cached ms values for the live overlay.
+            normalised.append({
+                **entry,
+                'start_time': int(start_ms or 0),
+                'end_time': int(end_ms or 0),
+            })
+        self._subtitle_entries = normalised
         self._refresh_live_subtitle(self.player.position())
 
     def _refresh_live_subtitle(self, position_ms: int) -> None:

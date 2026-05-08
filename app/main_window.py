@@ -1161,27 +1161,33 @@ class MainWindow(QMainWindow):
                 self.video_player.scene.removeItem(item)
         for entry in payload.get('texts', []) or []:
             try:
+                x = float(entry.get('x', 100))
+                y = float(entry.get('y', 100))
+                width = max(20.0, float(entry.get('width', 200)))
+                height = max(20.0, float(entry.get('height', 40)))
+                # Save uses ``pos() + rect()`` (scene-space). On load,
+                # we put the geometry into the local rect (origin at
+                # 0,0) and use ``setPos`` for the scene offset so the
+                # item lands exactly where it was saved.
                 node = DraggableTextItem(
-                    float(entry.get('x', 100)),
-                    float(entry.get('y', 100)),
+                    0.0, 0.0,
                     entry.get('text', 'Text'),
                     int(entry.get('font_size', 20)),
                     entry.get('color', '#ffffff'),
                 )
-                width = float(entry.get('width', 200))
-                height = float(entry.get('height', 40))
-                node.setRect(0, 0, max(20.0, width), max(20.0, height))
+                node.setRect(0, 0, width, height)
+                node.setPos(x, y)
                 self.video_player.scene.addItem(node)
             except Exception as exc:  # noqa: BLE001
                 logger.warning("preset: skipped text overlay (%s)", exc)
         for entry in payload.get('blurs', []) or []:
             try:
-                node = DraggableBlurRegion(
-                    float(entry.get('x', 50)),
-                    float(entry.get('y', 50)),
-                    float(entry.get('width', 150)),
-                    float(entry.get('height', 100)),
-                )
+                x = float(entry.get('x', 50))
+                y = float(entry.get('y', 50))
+                width = max(20.0, float(entry.get('width', 150)))
+                height = max(20.0, float(entry.get('height', 100)))
+                node = DraggableBlurRegion(0.0, 0.0, width, height)
+                node.setPos(x, y)
                 node.blur_strength = int(entry.get('strength', 15))
                 self.video_player.scene.addItem(node)
             except Exception as exc:  # noqa: BLE001
