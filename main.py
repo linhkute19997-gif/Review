@@ -11,6 +11,7 @@ from PyQt6.QtWidgets import QApplication, QMessageBox
 from PyQt6.QtGui import QFont
 
 from app.main_window import MainWindow
+from app.domain.prewarm import PrewarmService
 from app.utils.ffmpeg_check import check_ffmpeg
 from app.utils.logger import get_logger
 
@@ -30,7 +31,13 @@ def main():
         QMessageBox.critical(None, "Review Phim Pro — FFmpeg", message)
         sys.exit(1)
 
-    window = MainWindow()
+    # Background pre-warm of Whisper / PaddleOCR caches. Errors are
+    # swallowed inside the service — manual triggers in the dialog
+    # still work even if the warm-up fails on boot.
+    prewarm = PrewarmService()
+    prewarm.start()
+
+    window = MainWindow(prewarm=prewarm)
     window.show()
 
     sys.exit(app.exec())

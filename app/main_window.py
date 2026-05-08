@@ -5,19 +5,27 @@ import os
 import platform
 import subprocess
 import sys
+import time
 from pathlib import Path
 from PyQt6.QtWidgets import (
     QMainWindow, QWidget, QVBoxLayout, QHBoxLayout, QLabel, QPushButton,
     QLineEdit, QSplitter, QStackedWidget, QFileDialog, QMessageBox,
     QApplication, QSizePolicy, QTableWidgetItem
 )
-from PyQt6.QtCore import Qt, QSize, QUrl, QThread, pyqtSignal
+from PyQt6.QtCore import Qt, QSize, QTimer, QUrl, QThread, pyqtSignal
 from PyQt6.QtGui import QIcon, QAction
 
 from app.video_player import VideoPlayerSection
 from app.config_section import ConfigSection
 from app.subtitle_edit import SubtitleEditSection
 from app.render_section import RenderSection
+from app.domain.models import Job, MediaAsset, Project, Stage, StageStatus
+from app.domain.prewarm import PrewarmService, PrewarmStatus
+from app.domain.project_file import (
+    PROJECT_EXT, load as load_project_file, save as save_project_file,
+)
+from app.domain.render_queue import RenderQueue
+from app.render_queue_dialog import RenderQueueDialog
 from app.utils.config import (
     BASE_DIR, load_api_config,
     load_user_preferences, save_user_preferences,
@@ -27,6 +35,8 @@ from app.utils.logger import get_logger
 from app.utils.srt_parser import parse_srt
 
 logger = get_logger('main_window')
+
+_RENDER_QUEUE_DB = BASE_DIR / 'render_queue.db'
 
 
 class _PreviewThread(QThread):
@@ -68,7 +78,7 @@ class _PreviewThread(QThread):
 
 
 class MainWindow(QMainWindow):
-    def __init__(self):
+    def __init__(self, prewarm: PrewarmService = None):
         super().__init__()
         self.setWindowTitle("Review Phim Pro | V1.0.0")
         self.setMinimumSize(1100, 750)
@@ -82,6 +92,16 @@ class MainWindow(QMainWindow):
         self.render_thread = None
         self.voiceover_thread = None
         self._batch_pairs = []
+        self._current_project_path = ''
+        self._active_job = None
+
+        # Persistent render queue — used both for crash-recovery and
+        # the "Hàng Đợi Render" panel.
+        self.render_queue = RenderQueue(str(_RENDER_QUEUE_DB))
+
+        # Background pre-warm service (Whisper / PaddleOCR). Optional;
+        # ``main.py`` injects one but tests / scripts may pass ``None``.
+        self.prewarm = prewarm
 
         # Load QSS
         qss_path = Path(__file__).parent / 'styles' / 'dark_theme.qss'
@@ -90,12 +110,45 @@ class MainWindow(QMainWindow):
 
         self._build_menu()
         self._build_ui()
+        self._build_status_bar()
+        self._wire_prewarm()
+
+        # Offer to resume any jobs that were in-flight when the app last
+        # exited. Run after the event loop kicks in so the dialog appears
+        # on top of the fully-rendered main window.
+        QTimer.singleShot(500, self._maybe_resume_pending_jobs)
 
     # ═══════════════════════════════════════════════════════
     # Menu Bar
     # ═══════════════════════════════════════════════════════
     def _build_menu(self):
         menubar = self.menuBar()
+
+        # File / Project menu — .rpp save/load + render queue.
+        file_menu = menubar.addMenu("📁 Tệp")
+        new_action = QAction("Dự Án Mới", self)
+        new_action.triggered.connect(self._new_project)
+        file_menu.addAction(new_action)
+
+        open_action = QAction("Mở Dự Án (.rpp)…", self)
+        open_action.setShortcut("Ctrl+O")
+        open_action.triggered.connect(self._open_project)
+        file_menu.addAction(open_action)
+
+        save_action = QAction("Lưu Dự Án", self)
+        save_action.setShortcut("Ctrl+S")
+        save_action.triggered.connect(self._save_project)
+        file_menu.addAction(save_action)
+
+        save_as_action = QAction("Lưu Dự Án Như…", self)
+        save_as_action.setShortcut("Ctrl+Shift+S")
+        save_as_action.triggered.connect(self._save_project_as)
+        file_menu.addAction(save_as_action)
+
+        file_menu.addSeparator()
+        queue_action = QAction("📋 Hàng Đợi Render…", self)
+        queue_action.triggered.connect(self._open_render_queue)
+        file_menu.addAction(queue_action)
 
         # System menu
         system_menu = menubar.addMenu("⚙️ Hệ Thống")
@@ -114,7 +167,7 @@ class MainWindow(QMainWindow):
         out_action = QAction("📁 Thư mục lưu", self)
         out_action.triggered.connect(self._open_output_folder_dialog)
         system_menu.addAction(out_action)
-        self.menus = {'system': system_menu}
+        self.menus = {'system': system_menu, 'file': file_menu}
 
         # i18n is intentionally not exposed: only ~3 strings are translated,
         # so a switch action would mislead users. Implement full coverage
@@ -138,6 +191,11 @@ class MainWindow(QMainWindow):
         snow_action.setCheckable(True)
         snow_action.toggled.connect(self._toggle_snowflake)
         tools_menu.addAction(snow_action)
+
+        tools_menu.addSeparator()
+        prewarm_action = QAction("🔥 Nạp trước Whisper / OCR", self)
+        prewarm_action.triggered.connect(self._trigger_prewarm)
+        tools_menu.addAction(prewarm_action)
 
     # ═══════════════════════════════════════════════════════
     # Main UI
@@ -392,6 +450,17 @@ class MainWindow(QMainWindow):
         self.btn_start_video.setEnabled(False)
         self.btn_start_video.setText("⏳ Đang render...")
 
+        # Persist this render to the SQLite queue so a crash mid-render
+        # leaves a recoverable trail. _on_video_finished / _on_video_error
+        # finalise the entry on success / failure.
+        self._enqueue_active_render(
+            video_path=video_path,
+            output_path=output_video,
+            config=config,
+            subs=subtitles,
+            srt_path=srt_path,
+        )
+
         from app.threads.video_creator import VideoCreatorThread
         self.render_thread = VideoCreatorThread(
             video_path, output_video, config, subtitles, output_dir, overlays)
@@ -409,6 +478,7 @@ class MainWindow(QMainWindow):
         self.render_section.status_label.setText(text)
 
     def _on_video_error(self, text):
+        self._finalise_active_job(StageStatus.FAILED, error=text)
         QMessageBox.critical(self, "Lỗi Render", text)
         self.render_section.set_exporting_status(False)
         self.btn_start_video.setEnabled(True)
@@ -416,6 +486,7 @@ class MainWindow(QMainWindow):
         self.render_thread = None
 
     def _on_video_finished(self, path):
+        self._finalise_active_job(StageStatus.DONE)
         self.render_section.set_exporting_status(False)
         self.btn_start_video.setEnabled(True)
         self.btn_start_video.setText("▶ BẮT ĐẦU TẠO VIDEO")
@@ -835,4 +906,223 @@ class MainWindow(QMainWindow):
             'preview_width': max(self.video_player.view.width(), 1),
             'preview_height': max(self.video_player.view.height(), 1),
         }
+
+    # ═══════════════════════════════════════════════════════
+    # Phase 1 — Project file (.rpp), render queue, pre-warm
+    # ═══════════════════════════════════════════════════════
+    def _build_status_bar(self):
+        """Wire up the persistent status bar.
+
+        We surface two pieces of long-lived state here:
+
+        * the pre-warm progress (Whisper / OCR loading), and
+        * the active project path so the user can tell whether they
+          are editing a saved ``.rpp`` or an unsaved scratch session.
+        """
+        bar = self.statusBar()
+        self._project_status = QLabel("Dự án: (chưa lưu)")
+        self._prewarm_status = QLabel("Pre-warm: chưa chạy")
+        bar.addWidget(self._project_status, 1)
+        bar.addPermanentWidget(self._prewarm_status)
+
+    def _wire_prewarm(self):
+        if self.prewarm is None:
+            return
+        # Observers run on the worker thread; bounce back to GUI via
+        # QTimer so we never touch widgets from a non-Qt thread.
+        def _push(status: PrewarmStatus, label=self._prewarm_status):
+            QTimer.singleShot(
+                0, lambda: label.setText(f"Pre-warm: {status.summary()}"))
+        self.prewarm.add_observer(_push)
+
+    def _trigger_prewarm(self):
+        if self.prewarm is None:
+            QMessageBox.information(self, "Pre-warm",
+                                     "Service pre-warm chưa được khởi tạo.")
+            return
+        self.prewarm.start()
+        QMessageBox.information(self, "Pre-warm",
+                                 "Đang nạp Whisper / PaddleOCR ở chế độ nền."
+                                 " Tiến độ hiện ở thanh trạng thái.")
+
+    # ── Project file (.rpp) ──────────────────────────────────
+    def _new_project(self):
+        self._current_project_path = ''
+        self.video_input.clear()
+        self.srt_input.clear()
+        self.subtitle_edit.load_subtitles([])
+        self._project_status.setText("Dự án: (chưa lưu)")
+
+    def _open_project(self):
+        fp, _ = QFileDialog.getOpenFileName(
+            self, "Mở dự án", "",
+            f"Review Phim Pro (*{PROJECT_EXT});;All Files (*)")
+        if not fp:
+            return
+        try:
+            project = load_project_file(fp)
+        except Exception as exc:  # noqa: BLE001
+            QMessageBox.critical(self, "Mở dự án",
+                                  f"Không đọc được file:\n{exc}")
+            return
+        self._apply_project(project, fp)
+
+    def _save_project(self):
+        if not self._current_project_path:
+            self._save_project_as()
+            return
+        self._do_save_project(self._current_project_path)
+
+    def _save_project_as(self):
+        default = self._current_project_path or str(
+            BASE_DIR / 'output' / 'project.rpp')
+        fp, _ = QFileDialog.getSaveFileName(
+            self, "Lưu dự án", default,
+            f"Review Phim Pro (*{PROJECT_EXT});;All Files (*)")
+        if not fp:
+            return
+        if not fp.lower().endswith(PROJECT_EXT):
+            fp += PROJECT_EXT
+        self._do_save_project(fp)
+
+    def _do_save_project(self, fp: str):
+        project = self._build_project_snapshot(name=Path(fp).stem)
+        try:
+            save_project_file(project, fp)
+        except Exception as exc:  # noqa: BLE001
+            QMessageBox.critical(self, "Lưu dự án",
+                                  f"Không lưu được dự án:\n{exc}")
+            return
+        self._current_project_path = fp
+        self._project_status.setText(f"Dự án: {Path(fp).name}")
+        self.statusBar().showMessage(f"Đã lưu {fp}", 4000)
+
+    def _build_project_snapshot(self, name: str) -> Project:
+        """Capture the current editor state as a domain ``Project``."""
+        # Sync any pending table edits back into the in-memory list.
+        try:
+            self.subtitle_edit._sync_table_edits()
+        except Exception:  # noqa: BLE001 — defensive: editor may be empty
+            pass
+        subs = list(self.subtitle_edit._subtitles or [])
+        translation = {
+            'model': self.config_section.get_selected_model(),
+            'source': self.config_section.get_source_lang(),
+            'target': self.config_section.get_target_lang(),
+        }
+        project = Project(
+            name=name,
+            translation=translation,
+            config=self.config_section.get_config(),
+            subtitles=subs,
+        )
+        return project
+
+    def _apply_project(self, project: Project, path: str):
+        """Push a loaded project back into the editor widgets."""
+        self._current_project_path = path
+        self._project_status.setText(f"Dự án: {Path(path).name}")
+        if project.subtitles:
+            self.subtitle_edit.load_subtitles(list(project.subtitles))
+        self.statusBar().showMessage(
+            f"Đã mở dự án {project.name} ({len(project.jobs)} job)", 4000)
+
+    # ── Render queue persistence ────────────────────────────
+    def _open_render_queue(self):
+        dialog = RenderQueueDialog(self.render_queue,
+                                    on_retry=self._retry_queued_job,
+                                    parent=self)
+        dialog.exec()
+
+    def _retry_queued_job(self, job: Job):
+        """Re-render a job pulled from the persistent queue."""
+        video_asset = job.asset_by_kind('video')
+        if not video_asset or not os.path.exists(video_asset.path):
+            QMessageBox.warning(self, "Hàng đợi",
+                                 "Video gốc không còn tồn tại trên đĩa.")
+            return
+        srt_asset = job.asset_by_kind('srt')
+        subs = []
+        if srt_asset and os.path.exists(srt_asset.path):
+            try:
+                with open(srt_asset.path, 'r', encoding='utf-8-sig') as f:
+                    subs = parse_srt(f.read())
+            except Exception:  # noqa: BLE001
+                pass
+        config = dict(job.config or self.config_section.get_config())
+        output_dir = (os.path.dirname(job.output_path)
+                       if job.output_path else self._resolve_output_dir())
+        os.makedirs(output_dir, exist_ok=True)
+
+        self._active_job = job
+        from app.threads.video_creator import VideoCreatorThread
+        self.render_thread = VideoCreatorThread(
+            video_asset.path, job.output_path, config, subs, output_dir,
+            self._collect_overlay_data())
+        self.render_thread.progress.connect(self._on_video_progress)
+        self.render_thread.status.connect(self._on_video_status)
+        self.render_thread.error.connect(self._on_video_error)
+        self.render_thread.finished_video.connect(self._on_video_finished)
+        self.render_thread.start()
+        self.render_section.set_exporting_status(True, "Resume render…")
+
+    def _maybe_resume_pending_jobs(self):
+        try:
+            pending = self.render_queue.pending()
+        except Exception as exc:  # noqa: BLE001
+            logger.warning("Failed to read render queue: %s", exc)
+            return
+        if not pending:
+            return
+        # Mark anything that was RUNNING as PENDING so the queue UI
+        # shows them correctly (the worker is dead by now).
+        for job in pending:
+            status = job.stages.get(Stage.RENDER.value,
+                                     StageStatus.PENDING.value)
+            if status == StageStatus.RUNNING.value:
+                job.stages[Stage.RENDER.value] = StageStatus.PENDING.value
+                self.render_queue.update(job)
+        ans = QMessageBox.question(
+            self, "Hàng đợi render",
+            f"Có {len(pending)} job render chưa hoàn tất từ phiên trước.\n"
+            f"Mở hàng đợi để tiếp tục?",
+            QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No)
+        if ans == QMessageBox.StandardButton.Yes:
+            self._open_render_queue()
+
+    def _enqueue_active_render(self, video_path: str, output_path: str,
+                                config: dict, subs: list,
+                                srt_path: str = '') -> Job:
+        """Persist the in-flight render so it survives a crash."""
+        assets = [MediaAsset(kind='video', path=video_path)]
+        if srt_path:
+            assets.append(MediaAsset(kind='srt', path=srt_path))
+        job = Job(
+            name=Path(video_path).stem,
+            assets=assets,
+            config=dict(config),
+            output_path=output_path,
+            created_at=time.time(),
+        )
+        job.set_status(Stage.RENDER, StageStatus.RUNNING)
+        try:
+            self.render_queue.enqueue(job)
+        except Exception as exc:  # noqa: BLE001
+            logger.warning("Failed to enqueue render job: %s", exc)
+        self._active_job = job
+        return job
+
+    def _finalise_active_job(self, status: StageStatus,
+                              error: str = '') -> None:
+        job = self._active_job
+        if job is None:
+            return
+        job.set_status(Stage.RENDER, status, error=error or None)
+        if status == StageStatus.DONE:
+            job.progress = 100
+        try:
+            self.render_queue.update(job)
+        except Exception as exc:  # noqa: BLE001
+            logger.warning("Failed to update queue: %s", exc)
+        self._active_job = None
 
