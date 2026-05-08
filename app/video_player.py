@@ -319,7 +319,24 @@ class VideoPlayerSection(QWidget):
             self.bottom_border.hide()
 
     def get_all_overlays(self) -> dict:
-        """Get all overlay data for rendering."""
+        """Get all overlay data for rendering.
+
+        ``preview_width`` / ``preview_height`` MUST report the video
+        item's size, not the view's size. Overlay coordinates returned
+        by ``get_data()`` / ``get_region_data()`` are scene-space, and
+        :meth:`_fit_video_to_view` sets ``scene.sceneRect()`` equal to
+        ``video_item.boundingRect()`` — so the scene is bounded by the
+        scaled video preview, not by the surrounding view.
+
+        Earlier this returned ``self.view.width()`` /
+        ``self.view.height()`` which is *larger* than the video item
+        whenever the view has aspect-ratio letterboxing on the sides
+        or top/bottom. ``video_creator`` then scaled overlays by
+        ``video_w / view_w`` instead of ``video_w / item_w``, which
+        squeezed text/blur regions toward the top-left corner of the
+        rendered video instead of leaving them where the user placed
+        them.
+        """
         from app.overlays import DraggableTextItem, DraggableBlurRegion
         texts = []
         blurs = []
@@ -328,12 +345,13 @@ class VideoPlayerSection(QWidget):
                 texts.append(item.get_data())
             elif isinstance(item, DraggableBlurRegion):
                 blurs.append(item.get_region_data())
+        item_size = self.video_item.size()
         return {
             'texts': texts,
             'blurs': blurs,
             'logo_path': '',
-            'preview_width': max(self.view.width(), 1),
-            'preview_height': max(self.view.height(), 1),
+            'preview_width': max(int(item_size.width()), 1),
+            'preview_height': max(int(item_size.height()), 1),
         }
 
     def resizeEvent(self, event):
