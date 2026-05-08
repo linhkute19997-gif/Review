@@ -14,6 +14,7 @@ from app.utils.config import (
     load_styles_config, load_user_preferences, save_user_preferences
 )
 from app.utils.logger import get_logger
+from app.utils.theme import THEMES, apply_theme, save_theme_preference
 
 logger = get_logger('config_section')
 
@@ -54,6 +55,10 @@ class ConfigSection(QWidget):
         self._build_tab_cai_dat()
         self._build_tab_tach_phude()
         layout.addWidget(self.tabs)
+        # P3-9: tooltips for every config widget so first-run users
+        # don't have to guess what each toggle does. Done after the
+        # tab tree exists so the helper can resolve every widget.
+        self._install_tooltips()
 
     # ── Tab 1: Dịch Phụ Đề ──
     def _build_tab_dich_phude(self):
@@ -411,6 +416,22 @@ class ConfigSection(QWidget):
         content = QWidget()
         layout = QVBoxLayout(content)
         layout.setSpacing(8)
+        # P3-15: theme switcher (Dark / Light / System) lives at the
+        # top of the settings tab so users don't have to dig through
+        # menus to flip palettes.
+        layout.addWidget(QLabel("🎨 Giao Diện"))
+        theme_row = QHBoxLayout()
+        theme_row.addWidget(QLabel("Theme:"))
+        self.combo_theme = QComboBox()
+        self.combo_theme.addItems([
+            'Dả tối (Dark)',
+            'Sáng (Light)',
+            'Theo hệ điều hành',
+        ])
+        self.combo_theme.currentIndexChanged.connect(self._on_theme_changed)
+        theme_row.addWidget(self.combo_theme)
+        theme_row.addStretch()
+        layout.addLayout(theme_row)
         layout.addWidget(QLabel("📺 Độ Phân Giải Video Xuất"))
         self.chk_1080p = QCheckBox("  1080P (1920×1080 - Chuẩn HD)")
         self.chk_4k = QCheckBox("  4K HD Ultra (3840×2160 - Siêu Nét)")
@@ -490,6 +511,10 @@ class ConfigSection(QWidget):
             self.voice_srt_input.setText(fp)
 
     def _on_voice_provider_changed(self, index):
+        # P3-8: persist the *previous* provider's voice choice before
+        # we wipe the combo so every provider keeps its own "last used"
+        # voice independently.
+        self._save_active_provider_voice()
         provider = self.combo_voice_provider.currentText()
         self.combo_voice_type.clear()
         if 'Edge' in provider:
@@ -499,6 +524,50 @@ class ConfigSection(QWidget):
             self.combo_voice_type.addItems(['Việt Nam (Nữ)', 'Việt Nam (Nam)'])
         elif 'ElevenLabs' in provider:
             self.combo_voice_type.addItems(['Rachel', 'Domi', 'Bella', 'Antoni', 'Elli', 'Josh'])
+        # Restore the saved voice for the newly-selected provider.
+        self._restore_provider_voice(provider)
+
+    def _provider_pref_key(self, provider: str) -> str:
+        """Stable key for ``user_preferences.voice_per_provider``."""
+        return ''.join(c.lower() for c in provider if c.isalnum())
+
+    def _save_active_provider_voice(self) -> None:
+        """Stash the current provider's voice in user_preferences."""
+        provider = self.combo_voice_provider.currentText()
+        if not provider:
+            return
+        key = self._provider_pref_key(provider)
+        prefs = load_user_preferences()
+        per_provider = prefs.get('voice_per_provider', {}) or {}
+        per_provider[key] = self.combo_voice_type.currentIndex()
+        prefs['voice_per_provider'] = per_provider
+        save_user_preferences(prefs)
+
+    def _restore_provider_voice(self, provider: str) -> None:
+        """Re-apply the per-provider preference, if any."""
+        if not provider:
+            return
+        key = self._provider_pref_key(provider)
+        prefs = load_user_preferences()
+        per_provider = prefs.get('voice_per_provider', {}) or {}
+        idx = per_provider.get(key)
+        if isinstance(idx, int) and 0 <= idx < self.combo_voice_type.count():
+            self.combo_voice_type.setCurrentIndex(idx)
+
+    # ── P3-15 Theme switcher ────────────────────────────────────
+    def _on_theme_changed(self, index: int) -> None:
+        """Apply the new QSS theme and persist the choice."""
+        try:
+            from PyQt6.QtWidgets import QApplication
+        except ImportError:
+            return
+        if not (0 <= index < len(THEMES)):
+            return
+        theme = THEMES[index]
+        save_theme_preference(theme)
+        app = QApplication.instance()
+        if app is not None:
+            apply_theme(app, theme)
 
     def _load_styles(self):
         styles = load_styles_config()
@@ -540,8 +609,23 @@ class ConfigSection(QWidget):
             self.chk_flip.setChecked(prefs['flip_horizontal'])
         if 'orig_volume' in prefs:
             self.orig_volume.setValue(prefs['orig_volume'])
+        # P3-15: restore theme dropdown to the saved value (no QSS
+        # reapplication — main.py already did that on boot).
+        theme = prefs.get('theme', 'dark')
+        try:
+            theme_idx = THEMES.index(theme)
+        except ValueError:
+            theme_idx = 0
+        self.combo_theme.blockSignals(True)
+        self.combo_theme.setCurrentIndex(theme_idx)
+        self.combo_theme.blockSignals(False)
 
     def _save_user_preferences(self):
+        # P3-8: capture the current provider's voice in the per-provider
+        # map before we serialise so the next launch picks it up.
+        self._save_active_provider_voice()
+        prefs = load_user_preferences()
+        per_provider = prefs.get('voice_per_provider', {}) or {}
         save_user_preferences({
             'model_index': self.combo_model.currentIndex(),
             'src_lang_index': self.combo_src_lang.currentIndex(),
@@ -555,6 +639,9 @@ class ConfigSection(QWidget):
             'zoom_enabled': self.chk_zoom.isChecked(),
             'flip_horizontal': self.chk_flip.isChecked(),
             'orig_volume': self.orig_volume.value(),
+            'theme': prefs.get('theme', 'dark'),
+            'voice_per_provider': per_provider,
+            'output_folder': prefs.get('output_folder', ''),
         })
 
     def set_video_player(self, vp):
@@ -658,3 +745,78 @@ class ConfigSection(QWidget):
     def get_selected_style(self): return self.combo_style.currentText()
     def get_source_lang(self): return self.combo_src_lang.currentData()
     def get_target_lang(self): return self.combo_tgt_lang.currentData()
+
+    # ── P3-9 Tooltips ──────────────────────────────────────────
+    def _install_tooltips(self) -> None:
+        """Set tooltips for every interactive config widget.
+
+        Tooltips show on hover and are i18n-friendly: each entry is a
+        complete Vietnamese sentence so it reads naturally for the
+        primary user base.
+        """
+        tips = {
+            self.combo_src_lang: 'Ngôn ngữ của phụ đề gốc.',
+            self.combo_tgt_lang: 'Ngôn ngữ cần dịch sang.',
+            self.combo_model: 'Chọn mô hình dịch (Google miễn phí / '
+                              'Gemini / Baidu / ChatGPT).',
+            self.btn_api_config: 'Mở hộp thoại nhập / kiểm tra API key.',
+            self.combo_style: 'Phong cách dịch (vd: kinh dị, cổ trang).',
+            self.btn_translate: 'Tiến hành dịch phụ đề bằng mô hình đã chọn.',
+            self.combo_voice_provider:
+                'Nhà cung cấp TTS — mỗi nhà cung cấp giữ giọng '
+                'cuối cùng riêng.',
+            self.combo_voice_type: 'Giọng đọc cho lồng tiếng.',
+            self.voice_speed: 'Tốc độ đọc; 100% là mặc định.',
+            self.btn_preview_voice: 'Nghe thử giọng đã chọn bằng đoạn mẫu.',
+            self.btn_voice_only: 'Chỉ tạo file MP3 lồng tiếng (không render '
+                                 'video).',
+            self.chk_subtitle_enabled:
+                'Bật phụ đề văn bản trong video xuất.',
+            self.subtitle_size: 'Cỡ chữ phụ đề (px).',
+            self.btn_subtitle_color: 'Màu chữ phụ đề.',
+            self.chk_subtitle_bg: 'Bật nền cho chữ phụ đề.',
+            self.btn_subtitle_bg_color: 'Màu nền phụ đề.',
+            self.subtitle_bg_opacity: 'Độ trong suốt nền phụ đề (0–100%).',
+            self.subtitle_y: 'Vị trí Y của phụ đề (90 = gần cạnh dưới).',
+            self.subtitle_opacity: 'Độ trong suốt chữ (10–200%).',
+            self.rb_audio_mute: 'Tắt hoàn toàn âm thanh gốc.',
+            self.rb_audio_keep: 'Giữ âm thanh gốc.',
+            self.rb_audio_cond:
+                'Giữ âm gốc khi không có lồng tiếng (overlay TTS).',
+            self.orig_volume: 'Âm lượng âm thanh gốc (0–200%).',
+            self.chk_bg_music: 'Phát nhạc nền trong toàn bộ video.',
+            self.bg_music_path: 'File MP3/WAV sẽ được dùng làm nhạc nền.',
+            self.bg_music_volume: 'Âm lượng nhạc nền (0–100%).',
+            self.chk_voice_file: 'Dùng file voice có sẵn thay vì TTS.',
+            self.voice_file_path: 'File audio lồng tiếng bên ngoài.',
+            self.chk_top_border: 'Thêm thanh viền trên (header).',
+            self.btn_top_color: 'Màu nền thanh viền trên.',
+            self.top_height: 'Chiều cao thanh viền trên (px).',
+            self.top_text: 'Tiêu đề hiển thị trên thanh viền trên.',
+            self.btn_top_text_color: 'Màu chữ thanh viền trên.',
+            self.chk_bot_border: 'Thêm thanh viền dưới (footer).',
+            self.btn_bot_color: 'Màu nền thanh viền dưới.',
+            self.bot_height: 'Chiều cao thanh viền dưới (px).',
+            self.bot_text: 'Chú thích hiển thị trên thanh viền dưới.',
+            self.btn_bot_text_color: 'Màu chữ thanh viền dưới.',
+            self.logo_path: 'Ảnh logo se đông trên video xuất.',
+            self.chk_zoom: 'Phóng to nhẹ video để tránh đội biên.',
+            self.chk_flip: 'Lật ngang video (mẹo lách phát hiện bản quyền).',
+            self.chk_dynamic_zoom:
+                'Tự động phong/tiềm theo chu kỳ để video sinh động.',
+            self.zoom_value: 'Biên độ zoom (% so với bình thường).',
+            self.zoom_interval: 'Chu kỳ đổi zoom (giây).',
+            self.chk_1080p: 'Xuất độ phân giải 1920×1080.',
+            self.chk_4k: 'Xuất độ phân giải 3840×2160 (nặng hơn).',
+            self.combo_gpu:
+                'Chọn GPU encoder. \'auto\' để app tự dò.',
+            self.chk_shutdown: 'Tự tắt máy sau khi render xong (hỏi trước).',
+            self.combo_theme: 'Theme giao diện: Dark / Light / theo hệ điều hành.',
+            self.btn_open_extract:
+                'Mở công cụ tách phụ đề (Whisper AI hoặc PaddleOCR).',
+        }
+        for widget, text in tips.items():
+            try:
+                widget.setToolTip(text)
+            except Exception as exc:  # noqa: BLE001
+                logger.debug('tooltip set failed for %s: %s', widget, exc)

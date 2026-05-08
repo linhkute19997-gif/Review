@@ -20,14 +20,15 @@ The public API (``load_subtitles``, ``update_translated``,
 the app keeps working unchanged.
 """
 
-from typing import Dict, List
+from typing import Dict, List, Optional
 
 from PyQt6.QtCore import (
     QAbstractTableModel, QModelIndex, Qt
 )
+from PyQt6.QtGui import QUndoCommand, QUndoStack
 from PyQt6.QtWidgets import (
-    QHBoxLayout, QHeaderView, QLabel, QPushButton, QTableView,
-    QVBoxLayout, QWidget,
+    QCheckBox, QDialog, QHBoxLayout, QHeaderView, QLabel, QLineEdit,
+    QMessageBox, QPushButton, QTableView, QVBoxLayout, QWidget,
 )
 
 
@@ -108,11 +109,30 @@ class SubtitleTableModel(QAbstractTableModel):
         if index.column() != 2:
             return False
         row = index.row()
-        if 0 <= row < len(self._rows):
-            self._rows[row]['translated_text'] = str(value)
-            self.dataChanged.emit(index, index, [Qt.ItemDataRole.DisplayRole])
+        if not (0 <= row < len(self._rows)):
+            return False
+        new_text = str(value)
+        old_text = self._rows[row].get('translated_text', '')
+        if new_text == old_text:
             return True
-        return False
+        # Route the edit through the parent's undo stack so Ctrl+Z / Ctrl+Y
+        # work consistently across paginated edits and search/replace.
+        section = self.parent()
+        if isinstance(section, SubtitleEditSection):
+            section._push_edit_command(
+                self._page_offset + row, old_text, new_text)
+        else:
+            self._rows[row]['translated_text'] = new_text
+            self.dataChanged.emit(
+                index, index, [Qt.ItemDataRole.DisplayRole])
+        return True
+
+    def refresh_cell(self, abs_index: int) -> None:
+        """Force a redraw for ``abs_index`` if it's on the visible page."""
+        local = abs_index - self._page_offset
+        if 0 <= local < len(self._rows):
+            idx = self.index(local, 2)
+            self.dataChanged.emit(idx, idx, [Qt.ItemDataRole.DisplayRole])
 
 
 class PageNavWidget(QWidget):
@@ -183,6 +203,165 @@ class PageNavWidget(QWidget):
             self._page_changed_callback(page)
 
 
+class _TranslatedEditCommand(QUndoCommand):
+    """Undoable edit of a single ``translated_text`` cell (P3-6)."""
+
+    def __init__(self, section: 'SubtitleEditSection', abs_index: int,
+                 old_text: str, new_text: str,
+                 description: str = 'Sửa phụ đề'):
+        super().__init__(description)
+        self._section = section
+        self._index = abs_index
+        self._old = old_text
+        self._new = new_text
+
+    def redo(self) -> None:  # noqa: D401 — Qt API
+        self._section._set_translated(self._index, self._new)
+
+    def undo(self) -> None:  # noqa: D401 — Qt API
+        self._section._set_translated(self._index, self._old)
+
+
+class _BulkReplaceCommand(QUndoCommand):
+    """Undoable batch replace from the search/replace dialog (P3-5/P3-6)."""
+
+    def __init__(self, section: 'SubtitleEditSection',
+                 changes: List[tuple], description: str = 'Tìm & thay'):
+        # ``changes`` is a list of ``(abs_index, old_text, new_text)``.
+        super().__init__(f"{description} ({len(changes)} dòng)")
+        self._section = section
+        self._changes = changes
+
+    def redo(self) -> None:  # noqa: D401 — Qt API
+        for idx, _old, new in self._changes:
+            self._section._set_translated(idx, new)
+
+    def undo(self) -> None:  # noqa: D401 — Qt API
+        for idx, old, _new in self._changes:
+            self._section._set_translated(idx, old)
+
+
+class SearchReplaceDialog(QDialog):
+    """Find-and-replace dialog over the translated subtitle column."""
+
+    def __init__(self, section: 'SubtitleEditSection', parent=None):
+        super().__init__(parent or section)
+        self._section = section
+        self.setWindowTitle("Tìm & Thay (Ctrl+H)")
+        self.resize(420, 200)
+        self._build_ui()
+
+    def _build_ui(self) -> None:
+        layout = QVBoxLayout(self)
+
+        find_row = QHBoxLayout()
+        find_row.addWidget(QLabel("Tìm:"))
+        self.find_input = QLineEdit()
+        self.find_input.setPlaceholderText("Nhập chuỗi cần tìm...")
+        find_row.addWidget(self.find_input)
+        layout.addLayout(find_row)
+
+        replace_row = QHBoxLayout()
+        replace_row.addWidget(QLabel("Thay bằng:"))
+        self.replace_input = QLineEdit()
+        self.replace_input.setPlaceholderText("(để trống = xoá)")
+        replace_row.addWidget(self.replace_input)
+        layout.addLayout(replace_row)
+
+        opts = QHBoxLayout()
+        self.chk_case = QCheckBox("Phân biệt hoa/thường")
+        opts.addWidget(self.chk_case)
+        self.chk_original = QCheckBox("Tìm trong cột gốc (chỉ hiển thị)")
+        opts.addWidget(self.chk_original)
+        layout.addLayout(opts)
+
+        self._status = QLabel("")
+        self._status.setStyleSheet("color: #888;")
+        layout.addWidget(self._status)
+
+        buttons = QHBoxLayout()
+        btn_count = QPushButton("Đếm")
+        btn_count.clicked.connect(self._count)
+        buttons.addWidget(btn_count)
+        btn_replace_all = QPushButton("Thay tất cả")
+        btn_replace_all.setObjectName("btnTienHanh")
+        btn_replace_all.clicked.connect(self._replace_all)
+        buttons.addWidget(btn_replace_all)
+        btn_close = QPushButton("Đóng")
+        btn_close.clicked.connect(self.accept)
+        buttons.addWidget(btn_close)
+        layout.addLayout(buttons)
+
+    def _matches(self, needle: str, hay: str) -> bool:
+        if not self.chk_case.isChecked():
+            return needle.lower() in hay.lower()
+        return needle in hay
+
+    def _count(self) -> None:
+        needle = self.find_input.text()
+        if not needle:
+            self._status.setText("Nhập chuỗi cần tìm trước.")
+            return
+        col = 'text' if self.chk_original.isChecked() else 'translated_text'
+        hits = sum(1 for sub in self._section._subtitles
+                   if self._matches(needle, sub.get(col, '') or ''))
+        self._status.setText(f"Tìm thấy {hits} khớp trong cột '{col}'.")
+
+    def _replace_all(self) -> None:
+        needle = self.find_input.text()
+        if not needle:
+            self._status.setText("Nhập chuỗi cần tìm trước.")
+            return
+        # The original text column is read-only on purpose; replacing
+        # there silently would desync the editor from the source SRT.
+        if self.chk_original.isChecked():
+            QMessageBox.information(
+                self, "Tìm & Thay",
+                "Cột phụ đề gốc là chỉ-đọc. Hãy bỏ tick tuỳ chọn này"
+                " để thay trên bản đã dịch.")
+            return
+        replacement = self.replace_input.text()
+        case_sensitive = self.chk_case.isChecked()
+        changes: List[tuple] = []
+        for idx, sub in enumerate(self._section._subtitles):
+            old = sub.get('translated_text', '') or ''
+            if case_sensitive:
+                if needle not in old:
+                    continue
+                new = old.replace(needle, replacement)
+            else:
+                if needle.lower() not in old.lower():
+                    continue
+                # Case-insensitive replace via simple lowercase search.
+                new = _ireplace(old, needle, replacement)
+            if new != old:
+                changes.append((idx, old, new))
+        if not changes:
+            self._status.setText("Không có dòng nào khớp.")
+            return
+        self._section._apply_bulk_replace(changes)
+        self._status.setText(f"Đã thay {len(changes)} dòng.")
+
+
+def _ireplace(text: str, needle: str, replacement: str) -> str:
+    """Case-insensitive ``str.replace``."""
+    if not needle:
+        return text
+    out = []
+    lower = text.lower()
+    nlower = needle.lower()
+    i = 0
+    while i < len(text):
+        idx = lower.find(nlower, i)
+        if idx == -1:
+            out.append(text[i:])
+            break
+        out.append(text[i:idx])
+        out.append(replacement)
+        i = idx + len(needle)
+    return ''.join(out)
+
+
 class SubtitleEditSection(QWidget):
     """Two-column SRT editor with pagination, backed by a virtual model."""
 
@@ -193,6 +372,12 @@ class SubtitleEditSection(QWidget):
         self._subtitles: List[Dict] = []
         self._srt_files: List = []
         self._current_srt_page = 0
+        # P3-6: each user edit is wrapped in a QUndoCommand so Ctrl+Z
+        # / Ctrl+Y reverse / replay them. The stack also drives bulk
+        # replace from the search dialog.
+        self._undo_stack = QUndoStack(self)
+        self._undo_stack.setUndoLimit(200)
+        self._search_dialog: Optional[SearchReplaceDialog] = None
         self._build_ui()
 
     def _build_ui(self):
@@ -247,16 +432,50 @@ class SubtitleEditSection(QWidget):
         self._load_page(0)
 
     def update_translated(self, index: int, text: str):
-        """Update translated text for a specific subtitle.
+        """Update translated text from a non-UI source (e.g. translator thread).
 
-        Mutates the master list (always) and emits a targeted
-        ``dataChanged`` for the model only if the row is on the
-        visible page. Other pages pick up the change automatically
-        the next time they're loaded.
+        Skips the undo stack: machine-driven updates shouldn't end up
+        as user-visible undo steps. Manual edits flow through
+        :meth:`SubtitleTableModel.setData` instead.
         """
         if 0 <= index < len(self._subtitles):
             self._subtitles[index]['translated_text'] = text
-            self._model.update_translated(index, text)
+            self._model.refresh_cell(index)
+
+    # ── Undo / redo (P3-6) ───────────────────────────────────────
+    def undo(self) -> None:
+        if self._undo_stack.canUndo():
+            self._undo_stack.undo()
+
+    def redo(self) -> None:
+        if self._undo_stack.canRedo():
+            self._undo_stack.redo()
+
+    def _push_edit_command(self, abs_index: int,
+                           old_text: str, new_text: str) -> None:
+        """Wrap a manual cell edit in a :class:`QUndoCommand`."""
+        self._undo_stack.push(
+            _TranslatedEditCommand(self, abs_index, old_text, new_text))
+
+    def _set_translated(self, abs_index: int, text: str) -> None:
+        """Low-level write — used by undo/redo commands."""
+        if 0 <= abs_index < len(self._subtitles):
+            self._subtitles[abs_index]['translated_text'] = text
+            self._model.refresh_cell(abs_index)
+
+    def _apply_bulk_replace(self, changes: List[tuple]) -> None:
+        """Push a bulk replace command — see :class:`SearchReplaceDialog`."""
+        if changes:
+            self._undo_stack.push(_BulkReplaceCommand(self, changes))
+
+    # ── Search / Replace (P3-5) ─────────────────────────────────
+    def open_search_replace(self) -> None:
+        """Show (or focus) the find-and-replace dialog."""
+        if self._search_dialog is None:
+            self._search_dialog = SearchReplaceDialog(self, self)
+        self._search_dialog.show()
+        self._search_dialog.raise_()
+        self._search_dialog.activateWindow()
 
     # ── Internals ────────────────────────────────────────────────
     def _on_page_changed(self, page: int):

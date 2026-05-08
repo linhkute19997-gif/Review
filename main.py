@@ -15,6 +15,7 @@ from app.main_window import MainWindow
 from app.domain.prewarm import PrewarmService
 from app.utils.ffmpeg_check import check_ffmpeg
 from app.utils.logger import get_logger
+from app.utils.theme import apply_theme
 
 logger = get_logger('main')
 
@@ -38,6 +39,11 @@ def main():
     app = QApplication(sys.argv)
     app.setFont(QFont("Segoe UI", 10))
     app.setStyle("Fusion")
+
+    # P3-15: load the user's saved theme (Dark / Light / System) and
+    # apply the matching QSS before MainWindow constructs widgets so
+    # nothing flashes the wrong palette on first paint.
+    apply_theme(app)
 
     # Boot-time FFmpeg version check. We need ≥ 4.4 for atempo chaining,
     # ``-progress pipe:1``, and the modern ASS subtitle pipeline.

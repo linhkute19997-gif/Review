@@ -21,8 +21,9 @@ from typing import Callable, List, Optional
 
 from PyQt6.QtCore import Qt
 from PyQt6.QtWidgets import (
-    QDialog, QHBoxLayout, QHeaderView, QLabel, QMessageBox, QPushButton,
-    QTableWidget, QTableWidgetItem, QVBoxLayout, QWidget,
+    QComboBox, QDialog, QHBoxLayout, QHeaderView, QLabel, QLineEdit,
+    QMessageBox, QPushButton, QTableWidget, QTableWidgetItem,
+    QVBoxLayout, QWidget,
 )
 
 from app.domain.models import Job, Stage, StageStatus
@@ -62,14 +63,39 @@ class RenderQueueDialog(QDialog):
         header.setWordWrap(True)
         layout.addWidget(header)
 
-        self.table = QTableWidget(0, 6)
+        # P3-4: filter row — search by name/output + status combo. We
+        # filter client-side because the queue is small (<1k rows in
+        # typical use); a SQL-side filter would be marginal at best.
+        filter_row = QHBoxLayout()
+        filter_row.addWidget(QLabel("Lọc:"))
+        self.search_input = QLineEdit()
+        self.search_input.setPlaceholderText(
+            "Tên hoặc output chứa...")
+        self.search_input.textChanged.connect(self.refresh)
+        filter_row.addWidget(self.search_input, 1)
+
+        filter_row.addWidget(QLabel("Trạng thái:"))
+        self.status_filter = QComboBox()
+        self.status_filter.addItem('Tất cả', userData=None)
+        for status_value, label in _STATUS_LABEL.items():
+            self.status_filter.addItem(label, userData=status_value)
+        self.status_filter.currentIndexChanged.connect(self.refresh)
+        filter_row.addWidget(self.status_filter)
+
+        self._summary_label = QLabel("")
+        self._summary_label.setStyleSheet("color: #888;")
+        filter_row.addWidget(self._summary_label)
+        layout.addLayout(filter_row)
+
+        self.table = QTableWidget(0, 7)
         self.table.setHorizontalHeaderLabels([
-            'Job', 'Trạng thái', 'Tiến độ', 'Output', 'Cập nhật', 'ID',
+            'Job', 'Trạng thái', 'Tiến độ', 'Output',
+            'Thời gian', 'Cập nhật', 'ID',
         ])
         self.table.horizontalHeader().setSectionResizeMode(
             QHeaderView.ResizeMode.Stretch)
         self.table.horizontalHeader().setSectionResizeMode(
-            5, QHeaderView.ResizeMode.ResizeToContents)
+            6, QHeaderView.ResizeMode.ResizeToContents)
         self.table.setEditTriggers(QTableWidget.EditTrigger.NoEditTriggers)
         self.table.setSelectionBehavior(
             QTableWidget.SelectionBehavior.SelectRows)
@@ -101,24 +127,51 @@ class RenderQueueDialog(QDialog):
     # ── Slots ──────────────────────────────────────────────
     def refresh(self) -> None:
         jobs: List[Job] = self._queue.all()
-        self.table.setRowCount(len(jobs))
-        for row, job in enumerate(jobs):
+        # P3-4: client-side filter against the search box + status combo.
+        needle = (
+            self.search_input.text().strip().lower()
+            if hasattr(self, 'search_input') else '')
+        target_status = (
+            self.status_filter.currentData()
+            if hasattr(self, 'status_filter') else None)
+        filtered: List[Job] = []
+        for job in jobs:
+            render_status = job.stages.get(
+                Stage.RENDER.value, StageStatus.PENDING.value)
+            if target_status and render_status != target_status:
+                continue
+            if needle:
+                blob = ' '.join([
+                    job.name or '',
+                    job.output_path or '',
+                    job.id,
+                ]).lower()
+                if needle not in blob:
+                    continue
+            filtered.append(job)
+        self.table.setRowCount(len(filtered))
+        for row, job in enumerate(filtered):
             render_status = job.stages.get(
                 Stage.RENDER.value, StageStatus.PENDING.value)
             label = _STATUS_LABEL.get(render_status, render_status)
             updated = (datetime.fromtimestamp(job.updated_at).strftime(
                        '%Y-%m-%d %H:%M') if job.updated_at else '—')
+            duration = _format_duration(job.created_at, job.updated_at)
             row_items = [
                 QTableWidgetItem(job.name or '(không tên)'),
                 QTableWidgetItem(label),
                 QTableWidgetItem(f"{job.progress}%"),
                 QTableWidgetItem(job.output_path or '—'),
+                QTableWidgetItem(duration),
                 QTableWidgetItem(updated),
                 QTableWidgetItem(job.id[:8]),
             ]
             for col, item in enumerate(row_items):
                 item.setData(Qt.ItemDataRole.UserRole, job.id)
                 self.table.setItem(row, col, item)
+        if hasattr(self, '_summary_label'):
+            self._summary_label.setText(
+                f"{len(filtered)}/{len(jobs)} job")
 
     def _selected_job_id(self) -> Optional[str]:
         rows = self.table.selectionModel().selectedRows()
@@ -161,6 +214,22 @@ class RenderQueueDialog(QDialog):
         QMessageBox.information(self, "Hàng đợi",
                                 f"Đã xoá {removed} job đã hoàn tất.")
         self.refresh()
+
+
+def _format_duration(start: float, end: float) -> str:
+    """Render ``end - start`` as ``MM:SS`` or ``HH:MM:SS``.
+
+    Returns ``—`` if the times are missing or non-positive (e.g. job
+    that never moved out of PENDING).
+    """
+    if not start or not end or end <= start:
+        return '—'
+    total = int(end - start)
+    hours, rem = divmod(total, 3600)
+    minutes, seconds = divmod(rem, 60)
+    if hours:
+        return f"{hours:d}:{minutes:02d}:{seconds:02d}"
+    return f"{minutes:02d}:{seconds:02d}"
 
 
 __all__ = ['RenderQueueDialog']

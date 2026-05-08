@@ -25,6 +25,12 @@ class VideoPlayerSection(QWidget):
         self._overlays = []
         self._video_files = []
         self._current_page = 0
+        # P3-3: live subtitle preview state. ``_subtitle_entries`` is
+        # the master list (each entry has ``start_time``, ``end_time``
+        # and ``translated_text`` / ``text``); ``_subtitle_show_text``
+        # toggles between original and translated text on the overlay.
+        self._subtitle_entries: list = []
+        self._subtitle_show_text = True
 
     def _build_ui(self):
         layout = QVBoxLayout(self)
@@ -149,6 +155,11 @@ class VideoPlayerSection(QWidget):
     def _on_position_changed(self, position):
         self.slider.setValue(position)
         self._update_time_label()
+        # P3-3: keep the live subtitle text overlay in sync with the
+        # player's current position. Cheap O(n) scan — SRT lists are
+        # rarely above a few thousand entries; a binary search is
+        # not worth the extra complexity here.
+        self._refresh_live_subtitle(position)
 
     def _on_duration_changed(self, duration):
         self.slider.setRange(0, duration)
@@ -182,10 +193,56 @@ class VideoPlayerSection(QWidget):
 
     def show_subtitle_bar(self, visible: bool):
         """Show/hide subtitle preview bar."""
+        self._subtitle_show_text = bool(visible)
         if visible:
             self.subtitle_label.show()
+            self._refresh_live_subtitle(self.player.position())
         else:
             self.subtitle_label.hide()
+
+    # ── P3-3 live subtitle text preview ─────────────────────────
+    def set_subtitle_entries(self, entries: list) -> None:
+        """Feed the editor's subtitle list into the player overlay.
+
+        ``entries`` is the same shape as the SRT model (start/end in
+        milliseconds, ``translated_text`` preferred, falling back to
+        ``text``). Calling this with an empty list clears the overlay.
+        """
+        self._subtitle_entries = entries or []
+        self._refresh_live_subtitle(self.player.position())
+
+    def _refresh_live_subtitle(self, position_ms: int) -> None:
+        """Pick the entry that contains ``position_ms`` and paint it."""
+        if not self._subtitle_show_text:
+            return
+        if not self._subtitle_entries:
+            self.subtitle_label.setText('')
+            return
+        active = None
+        for entry in self._subtitle_entries:
+            start = entry.get('start_time') or 0
+            end = entry.get('end_time') or 0
+            if start <= position_ms <= end:
+                active = entry
+                break
+        if active is None:
+            self.subtitle_label.setText('')
+            self.subtitle_label.adjustSize()
+            return
+        text = active.get('translated_text') or active.get('text') or ''
+        self.subtitle_label.setText(text)
+        self.subtitle_label.adjustSize()
+        self._reposition_subtitle_label()
+
+    def _reposition_subtitle_label(self) -> None:
+        """Anchor the subtitle label centred near the bottom of the view."""
+        view_w = self.view.width()
+        view_h = self.view.height()
+        label_w = min(self.subtitle_label.width(), max(view_w - 40, 120))
+        label_h = self.subtitle_label.height()
+        x = max(0, (view_w - label_w) // 2)
+        y = max(0, view_h - label_h - 24)
+        self.subtitle_label.setGeometry(x, y, label_w, label_h)
 
     def update_subtitle_opacity(self, value: int):
         """Update subtitle opacity (1-200%)."""
@@ -256,6 +313,8 @@ class VideoPlayerSection(QWidget):
         if self.bottom_border.isVisible():
             y = self.view.height() - self.bottom_border.height()
             self.bottom_border.setGeometry(0, y, self.view.width(), self.bottom_border.height())
+        if self.subtitle_label.isVisible():
+            self._reposition_subtitle_label()
 
     def keyPressEvent(self, event):
         if event.key() == Qt.Key.Key_Space:
