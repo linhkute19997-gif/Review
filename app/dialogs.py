@@ -15,6 +15,9 @@ from app.utils.config import (
     load_api_config, save_api_config,
     load_styles_config, save_styles_config
 )
+from app.utils.logger import get_logger
+
+logger = get_logger('dialogs')
 
 
 class APIConfigDialog(QDialog):
@@ -51,11 +54,25 @@ class APIConfigDialog(QDialog):
         self.hint_label.setStyleSheet("color: #888; font-size: 11px;")
         layout.addWidget(self.hint_label)
 
-        # Save
+        # P3-10: let the user verify the key without committing it
+        # to disk. The status label below shows the result so users
+        # can see latency / quota errors immediately.
+        self._test_status = QLabel("")
+        self._test_status.setStyleSheet("color: #888; font-size: 11px;")
+        self._test_status.setWordWrap(True)
+        layout.addWidget(self._test_status)
+
+        # Save / Test row.
+        btn_row = QHBoxLayout()
+        btn_test = QPushButton("🧪 Test API Key")
+        btn_test.clicked.connect(self._test_api_key)
+        btn_row.addWidget(btn_test)
+
         btn_save = QPushButton("💾 Lưu Cấu Hình")
         btn_save.setObjectName("btnBatDau")
         btn_save.clicked.connect(self._save_config)
-        layout.addWidget(btn_save)
+        btn_row.addWidget(btn_save)
+        layout.addLayout(btn_row)
 
         # Load existing
         self._on_model_changed(0)
@@ -89,6 +106,118 @@ class APIConfigDialog(QDialog):
         save_api_config(config)
         QMessageBox.information(self, "Thành Công", f"Đã lưu API key cho {model}")
         self.accept()
+
+    # ── P3-10: API key test ───────────────────────────────────
+    def _test_api_key(self):
+        """Send a tiny probe request with the first key to validate it.
+
+        We deliberately use the *currently typed* keys (not the saved
+        ones) so users can validate before clicking Save. The probe is
+        per-model: each provider has its own minimal call.
+        """
+        model = self.combo_model.currentText()
+        keys = [k.strip() for k in self.api_input.toPlainText().splitlines()
+                if k.strip()]
+        for m in TRANSLATION_MODELS:
+            if m['name'] == model and not m.get('needs_api'):
+                self._test_status.setStyleSheet(
+                    "color: #00c853; font-size: 11px;")
+                self._test_status.setText(
+                    "Google miễn phí không cần API key.")
+                return
+        if not keys:
+            self._test_status.setStyleSheet(
+                "color: #ff5252; font-size: 11px;")
+            self._test_status.setText("Nhập ít nhất 1 API key trước.")
+            return
+        self._test_status.setStyleSheet(
+            "color: #ff9800; font-size: 11px;")
+        self._test_status.setText("Đang kiểm tra API key...")
+        # Actually run the probe in a worker so we don't freeze the UI.
+        self._probe = _ApiKeyProbeThread(model, keys[0])
+        self._probe.finished_with_result.connect(self._on_test_result)
+        self._probe.start()
+
+    def _on_test_result(self, ok: bool, message: str):
+        if ok:
+            self._test_status.setStyleSheet(
+                "color: #00c853; font-size: 11px;")
+            self._test_status.setText(f"✅ {message}")
+        else:
+            self._test_status.setStyleSheet(
+                "color: #ff5252; font-size: 11px;")
+            self._test_status.setText(f"❌ {message}")
+
+
+class _ApiKeyProbeThread(QThread):
+    """Background thread that hits the provider with a 1-token request."""
+    finished_with_result = pyqtSignal(bool, str)
+
+    def __init__(self, model: str, key: str):
+        super().__init__()
+        self._model = model
+        self._key = key
+
+    def run(self) -> None:  # noqa: D401 — Qt API
+        try:
+            ok, msg = self._probe()
+        except Exception as exc:  # noqa: BLE001
+            logger.warning('API probe crashed: %s', exc)
+            ok, msg = False, f"Lỗi: {exc}"
+        self.finished_with_result.emit(ok, msg)
+
+    def _probe(self) -> tuple:
+        m = self._model.lower()
+        if 'gemini' in m:
+            return self._probe_gemini()
+        if 'chatgpt' in m or 'gpt' in m:
+            return self._probe_openai()
+        if 'baidu' in m:
+            return self._probe_baidu()
+        return True, f"{self._model}: không có kiểm tra tự động, key đã được ghi nhận."
+
+    def _probe_gemini(self) -> tuple:
+        import requests
+        url = (
+            'https://generativelanguage.googleapis.com/v1beta/models?key='
+            + self._key)
+        try:
+            resp = requests.get(url, timeout=(5, 10))
+        except requests.RequestException as exc:
+            return False, f"Kết nối Gemini: {exc}"
+        if resp.status_code == 200:
+            return True, "Gemini API key hợp lệ."
+        if resp.status_code in (401, 403):
+            return False, "Gemini từ chối key (401/403)."
+        return False, f"Gemini HTTP {resp.status_code}."
+
+    def _probe_openai(self) -> tuple:
+        import requests
+        url = 'https://api.openai.com/v1/models'
+        try:
+            resp = requests.get(
+                url,
+                headers={'Authorization': f'Bearer {self._key}'},
+                timeout=(5, 10),
+            )
+        except requests.RequestException as exc:
+            return False, f"Kết nối OpenAI: {exc}"
+        if resp.status_code == 200:
+            return True, "ChatGPT API key hợp lệ."
+        if resp.status_code == 401:
+            return False, "OpenAI từ chối key (401)."
+        return False, f"OpenAI HTTP {resp.status_code}."
+
+    def _probe_baidu(self) -> tuple:
+        # Baidu format: 'appid|secret'. We do a token-cost-free check by
+        # validating just the format (a real translate request would
+        # consume quota for a full round trip).
+        if '|' not in self._key:
+            return False, "Baidu cần format 'appid|secretkey'."
+        appid, secret = self._key.split('|', 1)
+        if not appid.strip() or not secret.strip():
+            return False, "Baidu appid/secret không được để trống."
+        return True, "Baidu format đúng. Tắt kết nối thật khi dịch để đo quota."
 
 
 class StyleManagerDialog(QDialog):

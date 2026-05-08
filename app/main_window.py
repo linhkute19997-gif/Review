@@ -10,10 +10,10 @@ from pathlib import Path
 from PyQt6.QtWidgets import (
     QMainWindow, QWidget, QVBoxLayout, QHBoxLayout, QLabel, QPushButton,
     QLineEdit, QSplitter, QStackedWidget, QFileDialog, QMessageBox,
-    QApplication, QSizePolicy, QTableWidgetItem
+    QApplication, QSizePolicy, QTableWidgetItem, QDialog, QProgressBar
 )
 from PyQt6.QtCore import Qt, QSize, QTimer, QUrl, QThread, pyqtSignal
-from PyQt6.QtGui import QIcon, QAction
+from PyQt6.QtGui import QIcon, QAction, QKeySequence, QShortcut
 
 from app.video_player import VideoPlayerSection
 from app.config_section import ConfigSection
@@ -108,9 +108,15 @@ class MainWindow(QMainWindow):
         if qss_path.exists():
             self.setStyleSheet(qss_path.read_text(encoding='utf-8'))
 
+        # P3-1: accept dropped video / SRT files anywhere in the window.
+        # Actual MIME inspection lives in :meth:`dragEnterEvent` /
+        # :meth:`dropEvent`.
+        self.setAcceptDrops(True)
+
         self._build_menu()
         self._build_ui()
         self._build_status_bar()
+        self._build_shortcuts()
         self._wire_prewarm()
 
         # Offer to resume any jobs that were in-flight when the app last
@@ -191,6 +197,20 @@ class MainWindow(QMainWindow):
         snow_action.setCheckable(True)
         snow_action.toggled.connect(self._toggle_snowflake)
         tools_menu.addAction(snow_action)
+
+        tools_menu.addSeparator()
+        # P3-17: overlay layout presets — JSON snapshot of every text /
+        # blur item currently on the video scene plus the logo path.
+        # Border bars are sourced from ``ConfigSection`` so they are
+        # not (yet) part of the preset; we keep this scoped to the
+        # scene-level overlays the user actually drags around.
+        save_layout_action = QAction("💾 Lưu Layout Overlay…", self)
+        save_layout_action.triggered.connect(self._save_overlay_preset)
+        tools_menu.addAction(save_layout_action)
+
+        load_layout_action = QAction("📂 Tải Layout Overlay…", self)
+        load_layout_action.triggered.connect(self._load_overlay_preset)
+        tools_menu.addAction(load_layout_action)
 
         tools_menu.addSeparator()
         prewarm_action = QAction("🔥 Nạp trước Whisper / OCR", self)
@@ -341,6 +361,10 @@ class MainWindow(QMainWindow):
                 with open(fp, 'r', encoding='utf-8-sig') as f:
                     subs = parse_srt(f.read())
                 self.subtitle_edit.load_subtitles(subs)
+                # P3-3: feed entries into the player so the live
+                # subtitle overlay can paint actual text as the
+                # cursor moves.
+                self.video_player.set_subtitle_entries(subs)
             except Exception as e:
                 QMessageBox.warning(self, "Lỗi", f"Không đọc được SRT:\n{e}")
 
@@ -420,6 +444,10 @@ class MainWindow(QMainWindow):
         self.config_section.btn_translate.setEnabled(True)
         self.config_section.btn_translate.setText("▶ Tiến Hành Dịch Phụ Đề")
         self.translate_thread = None  # Cleanup stale thread reference
+        # P3-3: refresh the player overlay with the newly-translated
+        # text so the user sees the translation while reviewing.
+        self.video_player.set_subtitle_entries(
+            self.subtitle_edit._subtitles)
 
     # ═══════════════════════════════════════════════════════
     # Video creation
@@ -491,10 +519,46 @@ class MainWindow(QMainWindow):
         self.btn_start_video.setEnabled(True)
         self.btn_start_video.setText("▶ BẮT ĐẦU TẠO VIDEO")
         self.render_thread = None  # Cleanup stale reference
-        QMessageBox.information(self, "Hoàn Thành", f"Video đã được tạo:\n{path}")
+        # P3-2: ship a custom "Open output folder" button with the
+        # done dialog so the user doesn't have to hand-navigate to
+        # the saved video.
+        self._show_render_done_dialog(path)
         # Auto shutdown if configured
         if self.config_section.get_config().get('auto_shutdown'):
             self._schedule_shutdown(delay_seconds=60)
+
+    def _show_render_done_dialog(self, path: str):
+        """Post-render confirmation with shortcuts to the output file."""
+        box = QMessageBox(self)
+        box.setIcon(QMessageBox.Icon.Information)
+        box.setWindowTitle("Hoàn Thành")
+        box.setText(f"Video đã được tạo:\n{path}")
+        btn_open_folder = box.addButton(
+            "📂 Mở thư mục", QMessageBox.ButtonRole.ActionRole)
+        btn_open_file = box.addButton(
+            "▶ Mở video", QMessageBox.ButtonRole.ActionRole)
+        box.addButton(QMessageBox.StandardButton.Ok)
+        box.exec()
+        clicked = box.clickedButton()
+        if clicked is btn_open_folder:
+            self._open_folder_native(os.path.dirname(path) or '.')
+        elif clicked is btn_open_file:
+            self._open_folder_native(path)
+
+    @staticmethod
+    def _open_folder_native(target: str):
+        """Cross-platform ``open`` for files or directories."""
+        if not target:
+            return
+        try:
+            if sys.platform.startswith('win'):
+                os.startfile(target)  # type: ignore[attr-defined]
+            elif sys.platform == 'darwin':
+                subprocess.Popen(['open', target])
+            else:
+                subprocess.Popen(['xdg-open', target])
+        except Exception as exc:  # noqa: BLE001
+            logger.warning('open native target failed (%s): %s', target, exc)
 
     def _save_translated_srt(self):
         """Save translated subtitles to SRT file."""
@@ -523,23 +587,30 @@ class MainWindow(QMainWindow):
     # Menu actions
     # ═══════════════════════════════════════════════════════
     def _schedule_shutdown(self, delay_seconds=60):
-        """Schedule a system shutdown using the platform's native command.
+        """Show an auto-shutdown countdown (P3-11).
 
-        ``os.system('shutdown /s /t 60')`` only works on Windows; on Linux
-        and macOS it silently fails (or prints a stray error). We dispatch
-        on ``sys.platform`` and gracefully report errors back to the user.
+        We pop a :class:`ShutdownCountdownDialog` so the user can
+        cancel the shutdown if they realise they wanted to keep
+        the machine running. If the dialog confirms, we dispatch
+        ``shutdown`` on the user's platform.
         """
         try:
+            from app.shutdown_dialog import ShutdownCountdownDialog
+        except ImportError:
+            ShutdownCountdownDialog = None  # type: ignore
+
+        if ShutdownCountdownDialog is not None:
+            dialog = ShutdownCountdownDialog(int(delay_seconds), self)
+            if dialog.exec() != QDialog.DialogCode.Accepted:
+                # User cancelled — abort the shutdown entirely.
+                return
+        try:
             if sys.platform.startswith('win'):
-                cmd = ['shutdown', '/s', '/t', str(int(delay_seconds))]
+                cmd = ['shutdown', '/s', '/t', '5']
             elif sys.platform == 'darwin':
-                # macOS: shutdown -h +<minutes>
-                minutes = max(1, int(round(delay_seconds / 60)))
-                cmd = ['sudo', 'shutdown', '-h', f'+{minutes}']
+                cmd = ['sudo', 'shutdown', '-h', '+1']
             else:
-                # Linux / *nix: shutdown -h +<minutes>
-                minutes = max(1, int(round(delay_seconds / 60)))
-                cmd = ['shutdown', '-h', f'+{minutes}']
+                cmd = ['shutdown', '-h', '+1']
             subprocess.Popen(cmd)
         except Exception as exc:  # noqa: BLE001
             QMessageBox.warning(
@@ -663,6 +734,111 @@ class MainWindow(QMainWindow):
         from app.dialogs import DouyinDownloadDialog
         dialog = DouyinDownloadDialog(self)
         dialog.exec()
+
+    # ═══════════════════════════════════════════════════════
+    # Drag-drop (P3-1)
+    # ═══════════════════════════════════════════════════════
+    _VIDEO_EXTS = ('.mp4', '.mkv', '.mov', '.avi', '.webm', '.flv', '.m4v')
+    _SRT_EXTS = ('.srt',)
+
+    def dragEnterEvent(self, event):  # noqa: N802 — Qt API
+        """Accept drops only when at least one file looks usable."""
+        mime = event.mimeData()
+        if not mime.hasUrls():
+            return super().dragEnterEvent(event)
+        for url in mime.urls():
+            path = url.toLocalFile().lower()
+            if path.endswith(self._VIDEO_EXTS + self._SRT_EXTS):
+                event.acceptProposedAction()
+                return
+        super().dragEnterEvent(event)
+
+    def dragMoveEvent(self, event):  # noqa: N802 — Qt API
+        if event.mimeData().hasUrls():
+            event.acceptProposedAction()
+        else:
+            super().dragMoveEvent(event)
+
+    def dropEvent(self, event):  # noqa: N802 — Qt API
+        """Route dropped files to the matching input.
+
+        The first video drop populates the ``Video Gốc`` field and
+        loads it into the player. The first ``.srt`` drop fills the
+        SRT field and re-populates the editor.
+        """
+        urls = event.mimeData().urls()
+        if not urls:
+            return super().dropEvent(event)
+        videos = [u.toLocalFile() for u in urls
+                  if u.toLocalFile().lower().endswith(self._VIDEO_EXTS)]
+        srts = [u.toLocalFile() for u in urls
+                if u.toLocalFile().lower().endswith(self._SRT_EXTS)]
+        if videos:
+            self.video_input.setText(videos[0])
+            try:
+                self.video_player.load_video(videos[0])
+            except Exception as exc:  # noqa: BLE001
+                logger.warning('drop: load_video failed: %s', exc)
+        if srts:
+            self.srt_input.setText(srts[0])
+            try:
+                with open(srts[0], 'r', encoding='utf-8-sig') as f:
+                    subs = parse_srt(f.read())
+                self.subtitle_edit.load_subtitles(subs)
+                # P3-3: drag-drop SRT also feeds the live preview.
+                self.video_player.set_subtitle_entries(subs)
+            except Exception as exc:  # noqa: BLE001
+                logger.warning('drop: parse_srt failed: %s', exc)
+        if videos or srts:
+            event.acceptProposedAction()
+        else:
+            super().dropEvent(event)
+
+    # ═══════════════════════════════════════════════════════
+    # Keyboard shortcuts (P3-7)
+    # ═══════════════════════════════════════════════════════
+    def _build_shortcuts(self):
+        """Wire global shortcuts that mirror the main toolbar buttons.
+
+        Ctrl+S / Ctrl+Shift+S already come from the File menu actions
+        wired in :meth:`_build_menu`; we only add the action shortcuts
+        that don't have a menu entry.
+        """
+        QShortcut(QKeySequence("Ctrl+T"), self,
+                  activated=self._start_translate)
+        QShortcut(QKeySequence("Ctrl+R"), self,
+                  activated=self._start_create_video)
+        QShortcut(QKeySequence("Ctrl+B"), self,
+                  activated=self._start_batch_render)
+        QShortcut(QKeySequence("Ctrl+H"), self,
+                  activated=self._open_search_replace_dialog)
+        QShortcut(QKeySequence("Ctrl+Z"), self,
+                  activated=self._undo_subtitle)
+        QShortcut(QKeySequence("Ctrl+Y"), self,
+                  activated=self._redo_subtitle)
+        QShortcut(QKeySequence("Ctrl+Shift+Z"), self,
+                  activated=self._redo_subtitle)
+        QShortcut(QKeySequence("F2"), self,
+                  activated=self._open_extract_subtitle_dialog)
+
+    def _open_search_replace_dialog(self):
+        """Forward Ctrl+H to the subtitle editor."""
+        try:
+            self.subtitle_edit.open_search_replace()
+        except Exception as exc:  # noqa: BLE001
+            logger.debug('search/replace dialog failed: %s', exc)
+
+    def _undo_subtitle(self):
+        try:
+            self.subtitle_edit.undo()
+        except Exception:  # noqa: BLE001
+            pass
+
+    def _redo_subtitle(self):
+        try:
+            self.subtitle_edit.redo()
+        except Exception:  # noqa: BLE001
+            pass
 
     def closeEvent(self, event):
         """Save preferences on exit and stop threads."""
@@ -809,23 +985,20 @@ class MainWindow(QMainWindow):
         config = self.config_section.get_config()
         output_dir = self._resolve_output_dir()
 
-        # Add all to render table
+        # Add all to render table. P3-13 replaces the single status
+        # column with a progress bar + status text by routing through
+        # ``populate_batch`` which builds the full row up front.
         all_items = pairs + [(v, None) for v in unmatched]
-        self.render_section.table.setRowCount(len(all_items))
-
-        for i, item in enumerate(all_items):
-            if isinstance(item, tuple) and len(item) == 2:
-                video_path, srt_path = item
-            else:
-                video_path, srt_path = item, None
-
+        items_for_table = []
+        for item in all_items:
+            video_path = item[0] if isinstance(item, tuple) else item
             base = Path(video_path).stem
             out = os.path.join(output_dir, f"{base}_output.mp4")
-
-            self.render_section.table.setItem(i, 0, QTableWidgetItem(str(i + 1)))
-            self.render_section.table.setItem(i, 1, QTableWidgetItem(base))
-            self.render_section.table.setItem(i, 2, QTableWidgetItem(out))
-            self.render_section.table.setItem(i, 3, QTableWidgetItem("Đang chờ..."))
+            items_for_table.append({
+                'video_path': video_path,
+                'output_path': out,
+            })
+        self.render_section.populate_batch(items_for_table)
 
         self._batch_queue = all_items
         self._batch_index = 0
@@ -859,27 +1032,36 @@ class MainWindow(QMainWindow):
         self.render_thread = VideoCreatorThread(
             video_path, out, self._batch_config, subs, self._batch_output_dir,
             self._collect_overlay_data())
-        self.render_thread.progress.connect(self._on_video_progress)
+        self.render_thread.progress.connect(self._on_batch_item_progress)
         self.render_thread.status.connect(self._on_video_status)
         self.render_thread.error.connect(self._on_batch_error)
         self.render_thread.finished_video.connect(self._on_batch_item_done)
         self.render_thread.start()
-        self.render_section.set_exporting_status(True, f"Item {self._batch_index + 1}")
+        self.render_section.set_exporting_status(
+            True, f"Item {self._batch_index + 1}")
+        # P3-13: flip the per-row status to in-progress; the progress
+        # bar starts at 0 because populate_batch already initialised it.
+        self.render_section.set_batch_item_status(
+            self._batch_index, '⏵ Render...', '#ff9800')
+        self.render_section.set_batch_item_progress(self._batch_index, 0)
 
-        # Update table
-        self.render_section.table.setItem(
-            self._batch_index, 3, QTableWidgetItem("Đang render..."))
+    def _on_batch_item_progress(self, percent: int) -> None:
+        """Forward worker progress to both the global + batch row bars."""
+        self._on_video_progress(percent)
+        self.render_section.set_batch_item_progress(
+            self._batch_index, percent)
 
     def _on_batch_item_done(self, path):
-        self.render_section.table.setItem(
-            self._batch_index, 3, QTableWidgetItem("✅ Xong"))
+        self.render_section.mark_batch_item_done(
+            self._batch_index, ok=True)
         self.render_thread = None  # Cleanup before next
         self._batch_index += 1
         self._run_next_batch_item()
 
     def _on_batch_error(self, msg):
-        self.render_section.table.setItem(
-            self._batch_index, 3, QTableWidgetItem("❌ Lỗi"))
+        self.render_section.mark_batch_item_done(
+            self._batch_index, ok=False,
+            message=f"❌ Lỗi: {msg[:40]}" if msg else '❌ Lỗi')
         logger.error("Batch render item %s failed: %s", self._batch_index, msg)
         self._batch_index += 1
         # If last item errored, re-enable button
@@ -906,6 +1088,96 @@ class MainWindow(QMainWindow):
             'preview_width': max(self.video_player.view.width(), 1),
             'preview_height': max(self.video_player.view.height(), 1),
         }
+
+    # ── P3-17 overlay layout presets ─────────────────────────
+    _OVERLAY_PRESET_VERSION = 1
+
+    def _save_overlay_preset(self) -> None:
+        """Persist the current overlay scene to a JSON preset file."""
+        import json
+        snapshot = self._collect_overlay_data()
+        payload = {
+            'version': self._OVERLAY_PRESET_VERSION,
+            'logo_path': snapshot.get('logo_path', ''),
+            'texts': snapshot.get('texts', []),
+            'blurs': snapshot.get('blurs', []),
+            'preview_width': snapshot.get('preview_width', 1),
+            'preview_height': snapshot.get('preview_height', 1),
+        }
+        default = str(BASE_DIR / 'overlay_preset.json')
+        fp, _ = QFileDialog.getSaveFileName(
+            self, "Lưu Layout Overlay", default,
+            "Layout JSON (*.json);;All Files (*)")
+        if not fp:
+            return
+        if not fp.lower().endswith('.json'):
+            fp += '.json'
+        try:
+            with open(fp, 'w', encoding='utf-8') as f:
+                json.dump(payload, f, ensure_ascii=False, indent=2)
+        except Exception as exc:  # noqa: BLE001
+            QMessageBox.critical(self, "Layout Overlay",
+                                  f"Không lưu được layout:\n{exc}")
+            return
+        self.statusBar().showMessage(f"Đã lưu layout {Path(fp).name}", 4000)
+
+    def _load_overlay_preset(self) -> None:
+        """Replace the current overlay scene with a preset from disk."""
+        import json
+        from app.overlays import DraggableBlurRegion, DraggableTextItem
+        fp, _ = QFileDialog.getOpenFileName(
+            self, "Tải Layout Overlay", str(BASE_DIR),
+            "Layout JSON (*.json);;All Files (*)")
+        if not fp:
+            return
+        try:
+            with open(fp, 'r', encoding='utf-8') as f:
+                payload = json.load(f)
+        except Exception as exc:  # noqa: BLE001
+            QMessageBox.critical(self, "Layout Overlay",
+                                  f"Không đọc được layout:\n{exc}")
+            return
+        version = payload.get('version', 0)
+        if version > self._OVERLAY_PRESET_VERSION:
+            QMessageBox.warning(
+                self, "Layout Overlay",
+                f"Phiên bản layout {version} mới hơn app — sẽ thử tải nhưng "
+                "có thể thiếu thuộc tính.")
+        # Wipe existing draggable items so we don't accumulate.
+        for item in list(self.video_player.scene.items()):
+            if isinstance(item, (DraggableTextItem, DraggableBlurRegion)):
+                self.video_player.scene.removeItem(item)
+        for entry in payload.get('texts', []) or []:
+            try:
+                node = DraggableTextItem(
+                    float(entry.get('x', 100)),
+                    float(entry.get('y', 100)),
+                    entry.get('text', 'Text'),
+                    int(entry.get('font_size', 20)),
+                    entry.get('color', '#ffffff'),
+                )
+                width = float(entry.get('width', 200))
+                height = float(entry.get('height', 40))
+                node.setRect(0, 0, max(20.0, width), max(20.0, height))
+                self.video_player.scene.addItem(node)
+            except Exception as exc:  # noqa: BLE001
+                logger.warning("preset: skipped text overlay (%s)", exc)
+        for entry in payload.get('blurs', []) or []:
+            try:
+                node = DraggableBlurRegion(
+                    float(entry.get('x', 50)),
+                    float(entry.get('y', 50)),
+                    float(entry.get('width', 150)),
+                    float(entry.get('height', 100)),
+                )
+                node.blur_strength = int(entry.get('strength', 15))
+                self.video_player.scene.addItem(node)
+            except Exception as exc:  # noqa: BLE001
+                logger.warning("preset: skipped blur region (%s)", exc)
+        logo = (payload.get('logo_path') or '').strip()
+        if logo:
+            self.config_section.logo_path.setText(logo)
+        self.statusBar().showMessage(f"Đã tải layout {Path(fp).name}", 4000)
 
     # ═══════════════════════════════════════════════════════
     # Phase 1 — Project file (.rpp), render queue, pre-warm
