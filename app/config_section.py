@@ -1,0 +1,598 @@
+"""
+Config Section — 8-tab configuration panel
+"""
+from PyQt6.QtWidgets import (
+    QWidget, QVBoxLayout, QHBoxLayout, QLabel, QPushButton, QLineEdit,
+    QComboBox, QTabWidget, QSlider, QRadioButton, QButtonGroup,
+    QCheckBox, QSpinBox, QDoubleSpinBox, QFileDialog, QColorDialog,
+    QScrollArea, QSizePolicy, QGroupBox
+)
+from PyQt6.QtCore import Qt
+from app.utils.config import (
+    LANGUAGES, TRANSLATION_MODELS, DEFAULT_STYLES, VOICE_CONFIGS_EDGE_VI,
+    load_styles_config, load_user_preferences, save_user_preferences
+)
+
+
+def make_label(text, style=""):
+    lbl = QLabel(text)
+    if style:
+        lbl.setProperty("class", style)
+    return lbl
+
+
+class ConfigSection(QWidget):
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self.video_player = None
+        self._build_ui()
+        self._load_user_preferences()
+
+    def _build_ui(self):
+        layout = QVBoxLayout(self)
+        layout.setContentsMargins(0, 0, 0, 0)
+        self.tabs = QTabWidget()
+        self._build_tab_dich_phude()
+        self._build_tab_longtieng()
+        self._build_tab_phudevb()
+        self._build_tab_amthanh()
+        self._build_tab_khung_logo()
+        self._build_tab_lach_banquyen()
+        self._build_tab_cai_dat()
+        self._build_tab_tach_phude()
+        layout.addWidget(self.tabs)
+
+    # ── Tab 1: Dịch Phụ Đề ──
+    def _build_tab_dich_phude(self):
+        content = QWidget()
+        layout = QVBoxLayout(content)
+        layout.setSpacing(8)
+        # Source language
+        row = QHBoxLayout()
+        row.addWidget(QLabel("Dịch phụ đề từ:"))
+        self.combo_src_lang = QComboBox()
+        for name, code in LANGUAGES:
+            self.combo_src_lang.addItem(name, code)
+        self.combo_src_lang.setCurrentIndex(0)
+        row.addWidget(self.combo_src_lang)
+        row.addWidget(QLabel("→"))
+        self.combo_tgt_lang = QComboBox()
+        for name, code in LANGUAGES:
+            self.combo_tgt_lang.addItem(name, code)
+        self.combo_tgt_lang.setCurrentIndex(1)
+        row.addWidget(self.combo_tgt_lang)
+        layout.addLayout(row)
+        # Model
+        row2 = QHBoxLayout()
+        row2.addWidget(QLabel("Mô Hình Dịch:"))
+        self.combo_model = QComboBox()
+        for m in TRANSLATION_MODELS:
+            self.combo_model.addItem(m['name'])
+        row2.addWidget(self.combo_model)
+        self.btn_api_config = QPushButton("⚙️ Cấu Hình")
+        self.btn_api_config.setObjectName("btnCauHinh")
+        row2.addWidget(self.btn_api_config)
+        layout.addLayout(row2)
+        # Style
+        row3 = QHBoxLayout()
+        row3.addWidget(QLabel("Phong Cách Dịch:"))
+        self.combo_style = QComboBox()
+        self._load_styles()
+        row3.addWidget(self.combo_style)
+        self.btn_style_mgr = QPushButton("📝")
+        self.btn_style_mgr.setFixedWidth(36)
+        row3.addWidget(self.btn_style_mgr)
+        layout.addLayout(row3)
+        # Status
+        self.translate_status = QLabel("Sẵn Sàng Dịch")
+        self.translate_status.setProperty("class", "labelGreen")
+        layout.addWidget(self.translate_status)
+        # Translate button
+        self.btn_translate = QPushButton("▶ Tiến Hành Dịch Phụ Đề")
+        self.btn_translate.setObjectName("btnTienHanh")
+        layout.addWidget(self.btn_translate)
+        # Progress
+        self.translate_progress = QLabel("Tiến trình:")
+        self.translate_progress.setProperty("class", "labelDim")
+        layout.addWidget(self.translate_progress)
+        layout.addStretch()
+        self.tabs.addTab(content, "Dịch Phụ Đề")
+
+    # ── Tab 2: Lồng Tiếng ──
+    def _build_tab_longtieng(self):
+        content = QWidget()
+        layout = QVBoxLayout(content)
+        layout.setSpacing(8)
+        layout.addWidget(QLabel("ℹ️ Phụ đề để lồng tiếng sẽ lấy từ tab chỉnh sửa phụ đề."))
+        # Provider
+        row = QHBoxLayout()
+        row.addWidget(QLabel("Nhà Cung Cấp:"))
+        self.combo_voice_provider = QComboBox()
+        self.combo_voice_provider.addItems(["Edge TTS (miễn phí)", "Google TTS", "ElevenLabs"])
+        self.combo_voice_provider.currentIndexChanged.connect(self._on_voice_provider_changed)
+        row.addWidget(self.combo_voice_provider)
+        layout.addLayout(row)
+        # Voice type
+        row2 = QHBoxLayout()
+        row2.addWidget(QLabel("Giọng Đọc:"))
+        self.combo_voice_type = QComboBox()
+        for vc in VOICE_CONFIGS_EDGE_VI:
+            self.combo_voice_type.addItem(vc['label'])
+        row2.addWidget(self.combo_voice_type)
+        layout.addLayout(row2)
+        # Speed
+        row3 = QHBoxLayout()
+        row3.addWidget(QLabel("Tốc Độ Đọc:"))
+        self.voice_speed = QSpinBox()
+        self.voice_speed.setRange(50, 200)
+        self.voice_speed.setValue(100)
+        self.voice_speed.setSuffix("%")
+        row3.addWidget(self.voice_speed)
+        layout.addLayout(row3)
+        # Preview
+        self.btn_preview_voice = QPushButton("🔊 Nghe Thử")
+        layout.addWidget(self.btn_preview_voice)
+        # SRT browse for standalone voice
+        row4 = QHBoxLayout()
+        row4.addWidget(QLabel("Hoặc chọn file SRT:"))
+        self.voice_srt_input = QLineEdit()
+        self.voice_srt_input.setPlaceholderText("Chọn file .srt để lồng tiếng...")
+        row4.addWidget(self.voice_srt_input)
+        btn_browse = QPushButton("📂")
+        btn_browse.setFixedWidth(36)
+        btn_browse.clicked.connect(self._browse_srt_for_voice)
+        row4.addWidget(btn_browse)
+        layout.addLayout(row4)
+        self.btn_voice_only = QPushButton("▶ Tạo File Lồng Tiếng")
+        self.btn_voice_only.setObjectName("btnTienHanh")
+        layout.addWidget(self.btn_voice_only)
+        layout.addStretch()
+        self.tabs.addTab(content, "Lồng Tiếng")
+
+    # ── Tab 3: Phụ Đề Văn Bản ──
+    def _build_tab_phudevb(self):
+        content = QWidget()
+        layout = QVBoxLayout(content)
+        layout.setSpacing(8)
+        self.chk_subtitle_enabled = QCheckBox("Thêm Phụ Đề Văn Bản:")
+        self.chk_subtitle_enabled.setChecked(True)
+        layout.addWidget(self.chk_subtitle_enabled)
+        # Preview
+        self.subtitle_preview = QLabel("Đây là nơi chứa phụ đề")
+        self.subtitle_preview.setStyleSheet("background:#1a1a1a;color:white;padding:8px;border-radius:4px;font-size:13px;")
+        self.subtitle_preview.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        layout.addWidget(self.subtitle_preview)
+        # Font size
+        row = QHBoxLayout()
+        row.addWidget(QLabel("Cỡ Chữ:"))
+        self.subtitle_size = QSpinBox()
+        self.subtitle_size.setRange(8, 72)
+        self.subtitle_size.setValue(20)
+        row.addWidget(self.subtitle_size)
+        row.addWidget(QLabel("Màu:"))
+        self.btn_subtitle_color = QPushButton()
+        self.btn_subtitle_color.setFixedSize(30, 24)
+        self.btn_subtitle_color.setStyleSheet("background:#ffffff;border:1px solid #666;")
+        self.btn_subtitle_color.clicked.connect(lambda: self._pick_color(self.btn_subtitle_color))
+        row.addWidget(self.btn_subtitle_color)
+        layout.addLayout(row)
+        # BG
+        row2 = QHBoxLayout()
+        self.chk_subtitle_bg = QCheckBox("Nền Phụ Đề")
+        row2.addWidget(self.chk_subtitle_bg)
+        self.btn_subtitle_bg_color = QPushButton()
+        self.btn_subtitle_bg_color.setFixedSize(30, 24)
+        self.btn_subtitle_bg_color.setStyleSheet("background:#000000;border:1px solid #666;")
+        self.btn_subtitle_bg_color.clicked.connect(lambda: self._pick_color(self.btn_subtitle_bg_color))
+        row2.addWidget(self.btn_subtitle_bg_color)
+        row2.addWidget(QLabel("Opacity:"))
+        self.subtitle_bg_opacity = QSlider(Qt.Orientation.Horizontal)
+        self.subtitle_bg_opacity.setRange(0, 100)
+        self.subtitle_bg_opacity.setValue(80)
+        row2.addWidget(self.subtitle_bg_opacity)
+        layout.addLayout(row2)
+        # Y position
+        row3 = QHBoxLayout()
+        row3.addWidget(QLabel("Vị trí Y:"))
+        self.subtitle_y = QSlider(Qt.Orientation.Horizontal)
+        self.subtitle_y.setRange(0, 100)
+        self.subtitle_y.setValue(90)
+        row3.addWidget(self.subtitle_y)
+        layout.addLayout(row3)
+        # Opacity
+        row4 = QHBoxLayout()
+        row4.addWidget(QLabel("Độ trong suốt:"))
+        self.subtitle_opacity = QSlider(Qt.Orientation.Horizontal)
+        self.subtitle_opacity.setRange(10, 200)
+        self.subtitle_opacity.setValue(100)
+        row4.addWidget(self.subtitle_opacity)
+        layout.addLayout(row4)
+        layout.addStretch()
+        self.tabs.addTab(content, "Phụ Đề VB")
+
+    # ── Tab 4: Âm Thanh ──
+    def _build_tab_amthanh(self):
+        content = QWidget()
+        layout = QVBoxLayout(content)
+        layout.setSpacing(8)
+        layout.addWidget(QLabel("Âm Thanh Gốc:"))
+        self.audio_group = QButtonGroup(self)
+        self.rb_audio_mute = QRadioButton("Tắt Âm Thanh Gốc")
+        self.rb_audio_keep = QRadioButton("Giữ Lại Toàn Bộ Âm Thanh Gốc")
+        self.rb_audio_keep.setChecked(True)
+        self.rb_audio_cond = QRadioButton("Giữ Âm Thanh Gốc Khi Không Có Lồng Tiếng")
+        self.audio_group.addButton(self.rb_audio_mute, 0)
+        self.audio_group.addButton(self.rb_audio_keep, 1)
+        self.audio_group.addButton(self.rb_audio_cond, 2)
+        layout.addWidget(self.rb_audio_mute)
+        layout.addWidget(self.rb_audio_keep)
+        layout.addWidget(self.rb_audio_cond)
+        # Volume
+        row = QHBoxLayout()
+        row.addWidget(QLabel("Âm Lượng Âm Thanh Gốc:"))
+        self.orig_volume = QSlider(Qt.Orientation.Horizontal)
+        self.orig_volume.setRange(0, 200)
+        self.orig_volume.setValue(100)
+        row.addWidget(self.orig_volume)
+        self.orig_vol_label = QLabel("100%")
+        row.addWidget(self.orig_vol_label)
+        self.orig_volume.valueChanged.connect(lambda v: self.orig_vol_label.setText(f"{v}%"))
+        layout.addLayout(row)
+        # BG Music
+        layout.addWidget(QLabel("Nhạc Nền:"))
+        self.chk_bg_music = QCheckBox("Bật Nhạc Nền")
+        layout.addWidget(self.chk_bg_music)
+        row2 = QHBoxLayout()
+        self.bg_music_path = QLineEdit()
+        self.bg_music_path.setPlaceholderText("Chọn file nhạc nền...")
+        row2.addWidget(self.bg_music_path)
+        btn = QPushButton("📂")
+        btn.setFixedWidth(36)
+        btn.clicked.connect(self._select_music_file)
+        row2.addWidget(btn)
+        layout.addLayout(row2)
+        row3 = QHBoxLayout()
+        row3.addWidget(QLabel("Âm Lượng Nhạc Nền:"))
+        self.bg_music_volume = QSlider(Qt.Orientation.Horizontal)
+        self.bg_music_volume.setRange(0, 100)
+        self.bg_music_volume.setValue(30)
+        row3.addWidget(self.bg_music_volume)
+        layout.addLayout(row3)
+        # Voice file
+        self.chk_voice_file = QCheckBox("Thêm File Voice:")
+        layout.addWidget(self.chk_voice_file)
+        row4 = QHBoxLayout()
+        self.voice_file_path = QLineEdit()
+        self.voice_file_path.setPlaceholderText("Chọn file voice...")
+        row4.addWidget(self.voice_file_path)
+        btn2 = QPushButton("📂")
+        btn2.setFixedWidth(36)
+        btn2.clicked.connect(self._select_voice_file)
+        row4.addWidget(btn2)
+        layout.addLayout(row4)
+        layout.addStretch()
+        self.tabs.addTab(content, "Âm Thanh")
+
+    # ── Tab 5: Khung & Logo ──
+    def _build_tab_khung_logo(self):
+        content = QWidget()
+        layout = QVBoxLayout(content)
+        layout.setSpacing(8)
+        # Top border
+        self.chk_top_border = QCheckBox("Thêm Viền Trên:")
+        layout.addWidget(self.chk_top_border)
+        row = QHBoxLayout()
+        row.addWidget(QLabel("Màu:"))
+        self.btn_top_color = QPushButton()
+        self.btn_top_color.setFixedSize(30, 24)
+        self.btn_top_color.setStyleSheet("background:#ffff00;border:1px solid #3a3a5e;")
+        self.btn_top_color.clicked.connect(lambda: self._pick_color(self.btn_top_color))
+        row.addWidget(self.btn_top_color)
+        row.addWidget(QLabel("Chiều Cao:"))
+        self.top_height = QSpinBox()
+        self.top_height.setRange(10, 200)
+        self.top_height.setValue(40)
+        row.addWidget(self.top_height)
+        layout.addLayout(row)
+        row2 = QHBoxLayout()
+        row2.addWidget(QLabel("Tiêu đề:"))
+        self.top_text = QLineEdit()
+        self.top_text.setPlaceholderText("Nhập tiêu đề...")
+        row2.addWidget(self.top_text)
+        row2.addWidget(QLabel("Màu chữ:"))
+        self.btn_top_text_color = QPushButton()
+        self.btn_top_text_color.setFixedSize(30, 24)
+        self.btn_top_text_color.setStyleSheet("background:#000000;border:1px solid #3a3a5e;")
+        self.btn_top_text_color.clicked.connect(lambda: self._pick_color(self.btn_top_text_color))
+        row2.addWidget(self.btn_top_text_color)
+        layout.addLayout(row2)
+        # Bottom border
+        self.chk_bot_border = QCheckBox("Thêm Viền Dưới:")
+        layout.addWidget(self.chk_bot_border)
+        row3 = QHBoxLayout()
+        row3.addWidget(QLabel("Màu:"))
+        self.btn_bot_color = QPushButton()
+        self.btn_bot_color.setFixedSize(30, 24)
+        self.btn_bot_color.setStyleSheet("background:#000000;border:1px solid #3a3a5e;")
+        self.btn_bot_color.clicked.connect(lambda: self._pick_color(self.btn_bot_color))
+        row3.addWidget(self.btn_bot_color)
+        row3.addWidget(QLabel("Chiều Cao:"))
+        self.bot_height = QSpinBox()
+        self.bot_height.setRange(10, 200)
+        self.bot_height.setValue(40)
+        row3.addWidget(self.bot_height)
+        layout.addLayout(row3)
+        row4 = QHBoxLayout()
+        row4.addWidget(QLabel("Chú thích:"))
+        self.bot_text = QLineEdit()
+        self.bot_text.setPlaceholderText("Nhập chú thích...")
+        row4.addWidget(self.bot_text)
+        row4.addWidget(QLabel("Màu chữ:"))
+        self.btn_bot_text_color = QPushButton()
+        self.btn_bot_text_color.setFixedSize(30, 24)
+        self.btn_bot_text_color.setStyleSheet("background:#ffffff;border:1px solid #3a3a5e;")
+        self.btn_bot_text_color.clicked.connect(lambda: self._pick_color(self.btn_bot_text_color))
+        row4.addWidget(self.btn_bot_text_color)
+        layout.addLayout(row4)
+        # Logo
+        layout.addWidget(QLabel("Logo:"))
+        row5 = QHBoxLayout()
+        self.logo_path = QLineEdit()
+        self.logo_path.setPlaceholderText("Chọn file logo...")
+        row5.addWidget(self.logo_path)
+        btn_logo = QPushButton("📂")
+        btn_logo.setFixedWidth(36)
+        btn_logo.clicked.connect(self._select_logo_file)
+        row5.addWidget(btn_logo)
+        btn_del = QPushButton("🗑")
+        btn_del.setFixedWidth(36)
+        btn_del.clicked.connect(lambda: self.logo_path.clear())
+        row5.addWidget(btn_del)
+        layout.addLayout(row5)
+        layout.addStretch()
+        self.tabs.addTab(content, "Khung & Logo")
+
+    # ── Tab 6: Lách Bản Quyền ──
+    def _build_tab_lach_banquyen(self):
+        content = QWidget()
+        layout = QVBoxLayout(content)
+        layout.setSpacing(8)
+        self.chk_zoom = QCheckBox("Phóng To Video")
+        layout.addWidget(self.chk_zoom)
+        self.chk_flip = QCheckBox("Lật Ngang Video")
+        layout.addWidget(self.chk_flip)
+        # Dynamic zoom
+        self.chk_dynamic_zoom = QCheckBox("Thu Phóng Video Theo Thời Gian:")
+        layout.addWidget(self.chk_dynamic_zoom)
+        row = QHBoxLayout()
+        row.addWidget(QLabel("Zoom (%):"))
+        self.zoom_value = QSpinBox()
+        self.zoom_value.setRange(1, 50)
+        self.zoom_value.setValue(5)
+        row.addWidget(self.zoom_value)
+        row.addWidget(QLabel("Chu kỳ (s):"))
+        self.zoom_interval = QSpinBox()
+        self.zoom_interval.setRange(1, 60)
+        self.zoom_interval.setValue(10)
+        row.addWidget(self.zoom_interval)
+        layout.addLayout(row)
+        # Scan lines
+        layout.addWidget(QLabel("Đường Quét:"))
+        self.line_group = QButtonGroup(self)
+        rb1 = QRadioButton("Không")
+        rb1.setChecked(True)
+        rb2 = QRadioButton("Ngang")
+        rb3 = QRadioButton("Dọc")
+        rb4 = QRadioButton("Ngẫu nhiên")
+        self.line_group.addButton(rb1, 0)
+        self.line_group.addButton(rb2, 1)
+        self.line_group.addButton(rb3, 2)
+        self.line_group.addButton(rb4, 3)
+        for rb in [rb1, rb2, rb3, rb4]:
+            layout.addWidget(rb)
+        layout.addStretch()
+        self.tabs.addTab(content, "Lách BQ")
+
+    # ── Tab 7: Cài Đặt ──
+    def _build_tab_cai_dat(self):
+        content = QWidget()
+        layout = QVBoxLayout(content)
+        layout.setSpacing(8)
+        layout.addWidget(QLabel("📺 Độ Phân Giải Video Xuất"))
+        self.chk_1080p = QCheckBox("  1080P (1920×1080 - Chuẩn HD)")
+        self.chk_4k = QCheckBox("  4K HD Ultra (3840×2160 - Siêu Nét)")
+        self.chk_1080p.stateChanged.connect(lambda s: (
+            self.chk_4k.blockSignals(True),
+            self.chk_4k.setChecked(False),
+            self.chk_4k.blockSignals(False),
+        ) if s else None)
+        self.chk_4k.stateChanged.connect(lambda s: (
+            self.chk_1080p.blockSignals(True),
+            self.chk_1080p.setChecked(False),
+            self.chk_1080p.blockSignals(False),
+        ) if s else None)
+        layout.addWidget(self.chk_1080p)
+        layout.addWidget(self.chk_4k)
+        # GPU
+        layout.addWidget(QLabel("GPU:"))
+        self.combo_gpu = QComboBox()
+        self.combo_gpu.addItems(['auto', 'nvidia', 'amd', 'intel', 'cpu'])
+        layout.addWidget(self.combo_gpu)
+        layout.addWidget(QLabel("Tự Động Tắt Máy:"))
+        self.chk_shutdown = QCheckBox("Tắt máy sau khi render xong")
+        layout.addWidget(self.chk_shutdown)
+        layout.addStretch()
+        self.tabs.addTab(content, "Cài Đặt")
+
+    # ── Tab 8: Tách Phụ Đề ──
+    def _build_tab_tach_phude(self):
+        content = QWidget()
+        layout = QVBoxLayout(content)
+        layout.setSpacing(8)
+        layout.addWidget(QLabel("✂ Tách phụ đề tự động bằng AI hoặc OCR"))
+        layout.addWidget(QLabel("• Whisper AI: Nhận dạng giọng nói → phụ đề"))
+        layout.addWidget(QLabel("• PaddleOCR: Quét chữ trên video → phụ đề"))
+        self.btn_open_extract = QPushButton("✂ Mở Công Cụ Tách Phụ Đề")
+        self.btn_open_extract.setObjectName("btnTienHanh")
+        layout.addWidget(self.btn_open_extract)
+        layout.addStretch()
+        self.tabs.addTab(content, "Tách PĐ")
+
+    # ── Helpers ──
+    def _pick_color(self, button):
+        color = QColorDialog.getColor()
+        if color.isValid():
+            button.setStyleSheet(f"background:{color.name()};border:1px solid #3a3a5e;")
+
+    def _get_button_color(self, button):
+        style = button.styleSheet()
+        if 'background:' in style:
+            start = style.index('background:') + 11
+            end = style.index(';', start)
+            return style[start:end].strip()
+        return '#ffff00'
+
+    def _select_music_file(self):
+        fp, _ = QFileDialog.getOpenFileName(self, "Chọn nhạc nền", "",
+                    "Audio Files (*.mp3 *.wav *.aac *.m4a);;All Files (*)")
+        if fp:
+            self.bg_music_path.setText(fp)
+
+    def _select_voice_file(self):
+        fp, _ = QFileDialog.getOpenFileName(self, "Chọn tệp voice", "",
+                    "Audio Files (*.mp3 *.wav *.aac *.m4a);;All Files (*)")
+        if fp:
+            self.voice_file_path.setText(fp)
+
+    def _select_logo_file(self):
+        fp, _ = QFileDialog.getOpenFileName(self, "Chọn logo", "",
+                    "Image Files (*.png *.jpg *.jpeg *.bmp);;All Files (*)")
+        if fp:
+            self.logo_path.setText(fp)
+
+    def _browse_srt_for_voice(self):
+        fp, _ = QFileDialog.getOpenFileName(self, "Chọn SRT", "",
+                    "SRT Files (*.srt);;All Files (*)")
+        if fp:
+            self.voice_srt_input.setText(fp)
+
+    def _on_voice_provider_changed(self, index):
+        provider = self.combo_voice_provider.currentText()
+        self.combo_voice_type.clear()
+        if 'Edge' in provider:
+            for vc in VOICE_CONFIGS_EDGE_VI:
+                self.combo_voice_type.addItem(vc['label'])
+        elif 'Google' in provider:
+            self.combo_voice_type.addItems(['Việt Nam (Nữ)', 'Việt Nam (Nam)'])
+        elif 'ElevenLabs' in provider:
+            self.combo_voice_type.addItems(['Rachel', 'Domi', 'Bella', 'Antoni', 'Elli', 'Josh'])
+
+    def _load_styles(self):
+        styles = load_styles_config()
+        self.combo_style.clear()
+        for s in styles:
+            self.combo_style.addItem(s)
+
+    def _load_user_preferences(self):
+        prefs = load_user_preferences()
+        if 'model_index' in prefs:
+            self.combo_model.setCurrentIndex(prefs['model_index'])
+        if 'src_lang_index' in prefs:
+            self.combo_src_lang.setCurrentIndex(prefs['src_lang_index'])
+        if 'tgt_lang_index' in prefs:
+            self.combo_tgt_lang.setCurrentIndex(prefs['tgt_lang_index'])
+        if 'voice_provider' in prefs:
+            idx = prefs['voice_provider']
+            self.combo_voice_provider.setCurrentIndex(idx)
+            # Re-populate combo_voice_type to match the restored provider —
+            # currentIndexChanged may not fire if the index was already idx.
+            self._on_voice_provider_changed(idx)
+        if 'gpu_device' in prefs:
+            idx = self.combo_gpu.findText(prefs['gpu_device'])
+            if idx >= 0:
+                self.combo_gpu.setCurrentIndex(idx)
+        if 'voice_speed' in prefs:
+            self.voice_speed.setValue(prefs['voice_speed'])
+        if 'subtitle_size' in prefs:
+            self.subtitle_size.setValue(prefs['subtitle_size'])
+        if 'subtitle_y' in prefs:
+            self.subtitle_y.setValue(prefs['subtitle_y'])
+        if 'audio_mode' in prefs:
+            btn = self.audio_group.button(prefs['audio_mode'])
+            if btn:
+                btn.setChecked(True)
+        if 'zoom_enabled' in prefs:
+            self.chk_zoom.setChecked(prefs['zoom_enabled'])
+        if 'flip_horizontal' in prefs:
+            self.chk_flip.setChecked(prefs['flip_horizontal'])
+        if 'orig_volume' in prefs:
+            self.orig_volume.setValue(prefs['orig_volume'])
+
+    def _save_user_preferences(self):
+        save_user_preferences({
+            'model_index': self.combo_model.currentIndex(),
+            'src_lang_index': self.combo_src_lang.currentIndex(),
+            'tgt_lang_index': self.combo_tgt_lang.currentIndex(),
+            'voice_provider': self.combo_voice_provider.currentIndex(),
+            'gpu_device': self.combo_gpu.currentText(),
+            'voice_speed': self.voice_speed.value(),
+            'subtitle_size': self.subtitle_size.value(),
+            'subtitle_y': self.subtitle_y.value(),
+            'audio_mode': self.audio_group.checkedId(),
+            'zoom_enabled': self.chk_zoom.isChecked(),
+            'flip_horizontal': self.chk_flip.isChecked(),
+            'orig_volume': self.orig_volume.value(),
+        })
+
+    def set_video_player(self, vp):
+        self.video_player = vp
+
+    def get_config(self) -> dict:
+        audio_mode = self.audio_group.checkedId()
+        line_mode = self.line_group.checkedId()
+        return {
+            'text_subtitle_enabled': self.chk_subtitle_enabled.isChecked(),
+            'text_subtitle_size': self.subtitle_size.value(),
+            'text_subtitle_font': 'Arial',
+            'text_subtitle_color': self._get_button_color(self.btn_subtitle_color),
+            'text_subtitle_bg_enabled': self.chk_subtitle_bg.isChecked(),
+            'text_subtitle_bg_color': self._get_button_color(self.btn_subtitle_bg_color),
+            'text_subtitle_bg_opacity': self.subtitle_bg_opacity.value(),
+            'text_subtitle_y': self.subtitle_y.value(),
+            'text_subtitle_opacity': self.subtitle_opacity.value(),
+            'audio_mode': audio_mode,
+            'orig_volume': self.orig_volume.value(),
+            'bg_music_enabled': self.chk_bg_music.isChecked(),
+            'bg_music_path': self.bg_music_path.text(),
+            'bg_music_volume': self.bg_music_volume.value(),
+            'voice_file_enabled': self.chk_voice_file.isChecked(),
+            'voice_file_path': self.voice_file_path.text(),
+            'voice_file_volume': 100,
+            'top_border_enabled': self.chk_top_border.isChecked(),
+            'top_border_color': self._get_button_color(self.btn_top_color),
+            'top_border_text': self.top_text.text(),
+            'top_text_color': self._get_button_color(self.btn_top_text_color),
+            'top_border_height': self.top_height.value(),
+            'bot_border_enabled': self.chk_bot_border.isChecked(),
+            'bot_border_color': self._get_button_color(self.btn_bot_color),
+            'bot_border_text': self.bot_text.text(),
+            'bot_text_color': self._get_button_color(self.btn_bot_text_color),
+            'bot_border_height': self.bot_height.value(),
+            'logo_path': self.logo_path.text(),
+            'zoom_enabled': self.chk_zoom.isChecked(),
+            'flip_horizontal': self.chk_flip.isChecked(),
+            'dynamic_zoom_enabled': self.chk_dynamic_zoom.isChecked(),
+            'zoom_value': self.zoom_value.value(),
+            'zoom_interval': self.zoom_interval.value(),
+            'line_mode': line_mode,
+            'voice_speed_input': self.voice_speed.value(),
+            'resolution_1080p': self.chk_1080p.isChecked(),
+            'resolution_4k': self.chk_4k.isChecked(),
+            'gpu_device': self.combo_gpu.currentText(),
+            'auto_shutdown': self.chk_shutdown.isChecked(),
+        }
+
+    def get_selected_model(self): return self.combo_model.currentText()
+    def get_selected_style(self): return self.combo_style.currentText()
+    def get_source_lang(self): return self.combo_src_lang.currentData()
+    def get_target_lang(self): return self.combo_tgt_lang.currentData()
