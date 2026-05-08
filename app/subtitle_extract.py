@@ -1,8 +1,12 @@
 """
 Subtitle Extract Page — Whisper (audio) + PaddleOCR (visual)
 """
+import math
 import os
+import shutil
+import subprocess
 import sys
+import tempfile
 from pathlib import Path
 
 from PyQt6.QtWidgets import (
@@ -12,7 +16,7 @@ from PyQt6.QtWidgets import (
 )
 from PyQt6.QtCore import QThread, pyqtSignal
 
-from app.utils.config import WHISPER_MODEL_OPTIONS, BASE_DIR
+from app.utils.config import WHISPER_MODEL_OPTIONS, BASE_DIR, FFMPEG_PATH
 from app.utils.logger import get_logger
 
 logger = get_logger('subtitle_extract')
@@ -21,6 +25,19 @@ logger = get_logger('subtitle_extract')
 # load from disk; without these every extract reloaded them.
 _WHISPER_CACHE = {}
 _OCR_CACHE = {}
+
+# Audio chunks longer than this (seconds) get split for Whisper so the
+# user gets a real progress bar and very long files don't OOM.
+_WHISPER_CHUNK_SECONDS = 5 * 60
+
+
+def _detect_cuda() -> bool:
+    """True if torch reports a working CUDA device."""
+    try:
+        import torch
+        return bool(torch.cuda.is_available())
+    except Exception:  # noqa: BLE001 — any failure ⇒ no GPU
+        return False
 
 
 def _get_whisper_model(model_name, device):
@@ -32,9 +49,27 @@ def _get_whisper_model(model_name, device):
 
 
 def _get_paddle_ocr(lang):
-    if lang not in _OCR_CACHE:
-        from paddleocr import PaddleOCR
-        _OCR_CACHE[lang] = PaddleOCR(use_angle_cls=True, lang=lang)
+    """PaddleOCR singleton, GPU-aware.
+
+    PaddleOCR needs ``use_gpu=True`` *and* a GPU build of paddlepaddle
+    to actually benefit. We probe via torch (already a Whisper dep)
+    and fall back to CPU if the GPU constructor explodes.
+    """
+    if lang in _OCR_CACHE:
+        return _OCR_CACHE[lang]
+    from paddleocr import PaddleOCR
+    use_gpu = _detect_cuda()
+    try:
+        _OCR_CACHE[lang] = PaddleOCR(
+            use_angle_cls=True, lang=lang, use_gpu=use_gpu)
+    except Exception as exc:  # noqa: BLE001 — paddlepaddle CPU build, etc.
+        if use_gpu:
+            logger.warning(
+                "PaddleOCR GPU init failed (%s) — falling back to CPU", exc)
+            _OCR_CACHE[lang] = PaddleOCR(
+                use_angle_cls=True, lang=lang, use_gpu=False)
+        else:
+            raise
     return _OCR_CACHE[lang]
 
 # PaddleOCR language codes — see
@@ -97,7 +132,8 @@ class SubtitleExtractThread(QThread):
 
     def __init__(self, video_files, use_audio=True, lang_code='vi',
                  whisper_model_name='base', ocr_lang='ch',
-                 ocr_y_top=0.7, ocr_y_bot=1.0):
+                 ocr_y_top=0.7, ocr_y_bot=1.0,
+                 ocr_scene_threshold=8.0, ocr_min_interval_s=0.5):
         super().__init__()
         self.video_files = video_files
         self.use_audio = use_audio
@@ -109,6 +145,12 @@ class SubtitleExtractThread(QThread):
         self.ocr_y_top = max(0.0, min(1.0, float(ocr_y_top)))
         self.ocr_y_bot = max(self.ocr_y_top + 0.05,
                              min(1.0, float(ocr_y_bot)))
+        # Scene-change OCR sampling: only run OCR when the cropped
+        # subtitle band actually changes (mean abs delta on uint8
+        # pixels). Threshold ~8 catches typical subtitle transitions
+        # without firing on minor video noise.
+        self.ocr_scene_threshold = float(ocr_scene_threshold)
+        self.ocr_min_interval_s = max(0.1, float(ocr_min_interval_s))
         self.device = self._detect_device()
 
     def _detect_device(self):
@@ -139,83 +181,203 @@ class SubtitleExtractThread(QThread):
         self.progress.emit("Hoàn thành!")
         self.finished.emit(results)
 
+    def _ffmpeg_executable(self):
+        """Return bundled FFmpeg or PATH lookup."""
+        if os.path.exists(FFMPEG_PATH):
+            return FFMPEG_PATH
+        return shutil.which('ffmpeg') or 'ffmpeg'
+
+    def _probe_duration_seconds(self, video_path) -> float:
+        """Return media duration via FFprobe (0.0 on failure)."""
+        from app.utils.config import FFPROBE_PATH
+        ffprobe = FFPROBE_PATH if os.path.exists(FFPROBE_PATH) else 'ffprobe'
+        try:
+            result = subprocess.run(
+                [ffprobe, '-v', 'error', '-show_entries', 'format=duration',
+                 '-of', 'default=noprint_wrappers=1:nokey=1', str(video_path)],
+                capture_output=True, text=True, timeout=15,
+                creationflags=getattr(subprocess, 'CREATE_NO_WINDOW', 0))
+            return float((result.stdout or '0').strip() or 0)
+        except Exception as exc:  # noqa: BLE001
+            logger.debug("ffprobe duration failed: %s", exc)
+            return 0.0
+
     def _extract_from_audio(self, video_path):
-        """Extract subtitles from audio using Whisper."""
+        """Extract subtitles from audio using Whisper.
+
+        Long sources (> 5 min) are split into FFmpeg WAV chunks so the
+        UI can report ``Đang xử lý chunk i/N`` and we don't load a
+        full hour of audio into RAM at once.
+        """
         self.progress.emit(f"Tải model {self.whisper_model_name}...")
         try:
             model = _get_whisper_model(self.whisper_model_name, self.device)
         except ImportError:
-            import subprocess
             self.progress.emit("Đang cài đặt Whisper...")
             subprocess.run([sys.executable, '-m', 'pip', 'install', 'openai-whisper'],
                           creationflags=getattr(subprocess, 'CREATE_NO_WINDOW', 0))
             model = _get_whisper_model(self.whisper_model_name, self.device)
 
-        self.progress.emit("Đang nhận diện giọng nói...")
-        result = model.transcribe(str(video_path), language=self.lang_code)
+        duration = self._probe_duration_seconds(video_path)
+        if duration <= _WHISPER_CHUNK_SECONDS:
+            self.progress.emit("Đang nhận diện giọng nói...")
+            result = model.transcribe(
+                str(video_path), language=self.lang_code)
+            segments = list(result.get('segments', []))
+        else:
+            segments = self._transcribe_in_chunks(model, video_path, duration)
 
-        # Convert to SRT format
         srt_lines = []
-        for i, seg in enumerate(result.get('segments', []), 1):
+        for i, seg in enumerate(segments, 1):
             start = self._format_time(seg['start'])
             end = self._format_time(seg['end'])
-            text = seg['text'].strip()
+            text = (seg.get('text') or '').strip()
+            if not text:
+                continue
             srt_lines.append(f"{i}\n{start} --> {end}\n{text}\n")
-
         return '\n'.join(srt_lines)
 
-    def _extract_from_ocr(self, video_path):
-        """Extract subtitles from video using PaddleOCR.
+    def _transcribe_in_chunks(self, model, video_path, duration: float):
+        """Split into _WHISPER_CHUNK_SECONDS WAV files, transcribe each."""
+        chunks = max(1, math.ceil(duration / _WHISPER_CHUNK_SECONDS))
+        ffmpeg = self._ffmpeg_executable()
+        scratch = tempfile.mkdtemp(prefix='rpp-whisper-')
+        all_segments = []
+        try:
+            for c in range(chunks):
+                offset = c * _WHISPER_CHUNK_SECONDS
+                self.progress.emit(
+                    f"Whisper chunk {c+1}/{chunks} (từ giây {int(offset)})")
+                wav_path = os.path.join(scratch, f"chunk_{c:03d}.wav")
+                cmd = [
+                    ffmpeg, '-y', '-loglevel', 'error',
+                    '-ss', str(offset), '-t', str(_WHISPER_CHUNK_SECONDS),
+                    '-i', str(video_path),
+                    '-vn', '-ac', '1', '-ar', '16000',
+                    '-c:a', 'pcm_s16le', wav_path,
+                ]
+                try:
+                    subprocess.run(
+                        cmd, check=True, capture_output=True, timeout=600,
+                        creationflags=getattr(
+                            subprocess, 'CREATE_NO_WINDOW', 0))
+                except subprocess.CalledProcessError as exc:
+                    logger.warning(
+                        "ffmpeg chunk %d failed: %s",
+                        c, exc.stderr.decode('utf-8', 'ignore')[:200])
+                    continue
+                if not os.path.exists(wav_path):
+                    continue
+                try:
+                    chunk_result = model.transcribe(
+                        wav_path, language=self.lang_code)
+                except Exception as exc:  # noqa: BLE001
+                    logger.warning(
+                        "Whisper chunk %d transcribe failed: %s", c, exc)
+                    continue
+                for seg in chunk_result.get('segments', []):
+                    seg_copy = dict(seg)
+                    seg_copy['start'] = float(seg.get('start', 0)) + offset
+                    seg_copy['end'] = float(seg.get('end', 0)) + offset
+                    all_segments.append(seg_copy)
+        finally:
+            shutil.rmtree(scratch, ignore_errors=True)
+        return all_segments
 
-        Only the configured vertical band (default = bottom 30%) is
-        scanned, which both speeds up OCR and reduces false positives
-        from on-screen non-subtitle text.
+    def _extract_from_ocr(self, video_path):
+        """Extract subtitles from video using PaddleOCR with scene-change sampling.
+
+        We crop to the configured vertical band (default = bottom 30%)
+        and only run OCR when the band actually changes — measured as
+        mean absolute pixel delta. Static frames between subtitle
+        transitions are skipped, which is typically a 3–8x speedup
+        for review videos with long stable shots.
         """
         try:
             import cv2
+            import numpy as np
             ocr = _get_paddle_ocr(self.ocr_lang)
         except ImportError:
-            import subprocess
             self.progress.emit("Đang cài đặt OCR...")
             subprocess.run([sys.executable, '-m', 'pip', 'install',
                           'opencv-python', 'paddleocr', 'paddlepaddle'],
                           creationflags=getattr(subprocess, 'CREATE_NO_WINDOW', 0))
             import cv2
+            import numpy as np
             ocr = _get_paddle_ocr(self.ocr_lang)
         cap = cv2.VideoCapture(str(video_path))
         fps = cap.get(cv2.CAP_PROP_FPS) or 25
-        sample_interval = max(1, int(fps))  # 1 frame/second
+        # Sample at roughly _ocr_min_interval_s_ but never less than
+        # one frame — at >0.5s we still catch every subtitle, plus the
+        # scene-delta check makes redundant samples free.
+        sample_interval = max(1, int(round(fps * self.ocr_min_interval_s)))
 
-        srt_entries = []
+        # Hold OCR hits as structured entries so we can extend end-time
+        # while the same subtitle is on screen.
+        entries: list[dict] = []  # {start, end, text}
         frame_idx = 0
         prev_text = ""
+        prev_band_small = None  # 32-row downsample for fast diff
+        threshold = self.ocr_scene_threshold
 
         while cap.isOpened():
             ret, frame = cap.read()
             if not ret:
                 break
             if frame_idx % sample_interval == 0:
-                # Crop to the configured band before OCR.
                 h = frame.shape[0]
                 y0 = int(h * self.ocr_y_top)
                 y1 = int(h * self.ocr_y_bot)
                 crop = frame[y0:y1, :] if y1 > y0 else frame
-                result = ocr.ocr(crop, cls=True)
-                if result and result[0]:
-                    texts = [line[1][0] for line in result[0] if line[1][1] > 0.7]
-                    text = ' '.join(texts)
+                cur_sec = frame_idx / fps
+
+                # Cheap delta check on a downsample to skip static frames.
+                gray = cv2.cvtColor(crop, cv2.COLOR_BGR2GRAY)
+                small = cv2.resize(gray, (160, 32),
+                                   interpolation=cv2.INTER_AREA)
+                changed = (
+                    prev_band_small is None
+                    or float(np.mean(
+                        np.abs(small.astype(np.int16)
+                               - prev_band_small.astype(np.int16))))
+                    >= threshold
+                )
+                if changed:
+                    prev_band_small = small
+                    result = ocr.ocr(crop, cls=True)
+                    text = ''
+                    if result and result[0]:
+                        texts = [line[1][0] for line in result[0]
+                                 if line[1][1] > 0.7]
+                        text = ' '.join(texts)
                     if text and text != prev_text:
-                        start_sec = frame_idx / fps
-                        end_sec = start_sec + 1.0
-                        idx = len(srt_entries) + 1
-                        srt_entries.append(
-                            f"{idx}\n{self._format_time(start_sec)} --> "
-                            f"{self._format_time(end_sec)}\n{text}\n")
+                        entries.append({
+                            'start': cur_sec,
+                            'end': cur_sec + 1.0,
+                            'text': text,
+                        })
                         prev_text = text
+                    elif not text and prev_text:
+                        # Subtitle vanished — close out lingering entry.
+                        prev_text = ''
+                else:
+                    # Static frame, same subtitle still on screen — push
+                    # the active entry's end forward so it tracks reality.
+                    if entries and prev_text:
+                        entries[-1]['end'] = max(
+                            entries[-1]['end'], cur_sec + 0.5)
             frame_idx += 1
 
         cap.release()
-        return '\n'.join(srt_entries)
+        logger.debug("OCR scanned %d frames, found %d subtitles",
+                     frame_idx, len(entries))
+
+        srt_lines = []
+        for i, ent in enumerate(entries, 1):
+            srt_lines.append(
+                f"{i}\n{self._format_time(ent['start'])} --> "
+                f"{self._format_time(ent['end'])}\n{ent['text']}\n")
+        return '\n'.join(srt_lines)
 
     def _format_time(self, seconds):
         hours = int(seconds // 3600)

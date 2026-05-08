@@ -7,7 +7,7 @@ from PyQt6.QtWidgets import (
     QCheckBox, QSpinBox, QDoubleSpinBox, QFileDialog, QColorDialog,
     QScrollArea, QSizePolicy, QGroupBox
 )
-from PyQt6.QtCore import Qt
+from PyQt6.QtCore import Qt, QTimer
 
 from app.utils.config import (
     LANGUAGES, TRANSLATION_MODELS, DEFAULT_STYLES, VOICE_CONFIGS_EDGE_VI,
@@ -29,6 +29,15 @@ class ConfigSection(QWidget):
     def __init__(self, parent=None):
         super().__init__(parent)
         self.video_player = None
+        # Single-shot debounce timer (P2-7) — every signal connected
+        # via ``_wire_live_preview`` restarts the timer; only the
+        # last keystroke / spin-tick within 150 ms repaints the
+        # video player. Keeps the UI smooth at 60 fps even while
+        # the user is dragging a slider.
+        self._preview_debounce = QTimer(self)
+        self._preview_debounce.setSingleShot(True)
+        self._preview_debounce.setInterval(150)
+        self._preview_debounce.timeout.connect(self._apply_live_preview)
         self._build_ui()
         self._load_user_preferences()
 
@@ -558,7 +567,7 @@ class ConfigSection(QWidget):
         self._apply_live_preview()
 
     def _wire_live_preview(self):
-        """Connect every preview-affecting widget to ``_apply_live_preview``."""
+        """Connect every preview-affecting widget to the debounced trigger."""
         widgets_state = [
             self.chk_subtitle_enabled.toggled,
             self.subtitle_opacity.valueChanged,
@@ -570,7 +579,11 @@ class ConfigSection(QWidget):
             self.bot_text.textChanged,
         ]
         for sig in widgets_state:
-            sig.connect(lambda *_: self._apply_live_preview())
+            sig.connect(lambda *_: self._schedule_preview())
+
+    def _schedule_preview(self):
+        """Restart the 150 ms preview debounce timer."""
+        self._preview_debounce.start()
 
     def _apply_live_preview(self):
         """Push current subtitle/border config into the attached video player."""

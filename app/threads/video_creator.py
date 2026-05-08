@@ -38,6 +38,66 @@ class VideoCreatorThread(QThread):
         self.overlays = overlays or {}
         self._running = True
 
+    @staticmethod
+    def _detect_hwaccel():
+        """Cached probe of ``ffmpeg -hwaccels`` output.
+
+        Returns a dict ``{'available': set[str], 'has_cuda', 'has_qsv', ...}``.
+        Cached on the class so the cost is paid once per Python process,
+        not once per render. (P2-3: input-side decode acceleration.)
+        """
+        cache = getattr(VideoCreatorThread, '_HWACCEL_CACHE', None)
+        if cache is not None:
+            return cache
+        ffmpeg = FFMPEG_PATH if os.path.exists(FFMPEG_PATH) else 'ffmpeg'
+        accels: set[str] = set()
+        try:
+            res = subprocess.run(
+                [ffmpeg, '-hide_banner', '-hwaccels'],
+                capture_output=True, timeout=10,
+                creationflags=getattr(subprocess, 'CREATE_NO_WINDOW', 0))
+            for line in res.stdout.decode('utf-8', errors='ignore').splitlines():
+                tok = line.strip()
+                # Skip the header line "Hardware acceleration methods:".
+                if tok and ':' not in tok:
+                    accels.add(tok)
+        except Exception as exc:  # noqa: BLE001
+            logger.debug("hwaccel probe failed: %s", exc)
+        cache = {
+            'available': accels,
+            'has_cuda': 'cuda' in accels,
+            'has_qsv': 'qsv' in accels,
+            'has_dxva2': 'dxva2' in accels,
+            'has_d3d11va': 'd3d11va' in accels,
+            'has_videotoolbox': 'videotoolbox' in accels,
+            'has_vaapi': 'vaapi' in accels,
+        }
+        VideoCreatorThread._HWACCEL_CACHE = cache
+        if accels:
+            logger.debug("FFmpeg hwaccels available: %s", sorted(accels))
+        return cache
+
+    def _build_input_hwaccel_args(self, w, h):
+        """Return flags to prepend before the main ``-i video``.
+
+        Uses ``-hwaccel auto`` so FFmpeg picks the best available
+        decoder; on systems without any hwaccel this is a no-op.
+        For 4K NVIDIA we explicitly select ``cuda`` since it can
+        decode directly into GPU memory (1.5-3× faster than software).
+        """
+        info = self._detect_hwaccel()
+        if not info['available']:
+            return []
+        # 4K + NVIDIA: pin to CUDA so frames stay on the GPU when paired
+        # with NVENC encoders downstream. Falls back to software decode
+        # if the input codec isn't supported by cuvid.
+        is_4k = (w and w >= 3840) or (h and h >= 2160)
+        if is_4k and info['has_cuda']:
+            return ['-hwaccel', 'cuda']
+        if is_4k and info['has_qsv']:
+            return ['-hwaccel', 'qsv']
+        return ['-hwaccel', 'auto']
+
     def _build_universal_encoder_list(self, gpu_device='auto'):
         """Build encoder fallback chain: GPU → CPU."""
         encoders = []
@@ -523,6 +583,12 @@ Format: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text
 
                 self.status.emit(f"Đang thử: {enc_desc}")
                 cmd = [ffmpeg, '-y', '-loglevel', 'warning', '-hide_banner']
+                # P2-3: Probe + prepend hwaccel flags before the main
+                # input only. Audio / logo inputs go through software
+                # since they're irrelevant for video decode acceleration.
+                hwaccel_args = self._build_input_hwaccel_args(w, h)
+                if hwaccel_args:
+                    cmd.extend(hwaccel_args)
                 cmd.extend(inputs_list)
 
                 if use_complex and complex_filter_parts:
