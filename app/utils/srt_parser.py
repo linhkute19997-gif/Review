@@ -5,7 +5,7 @@ Parse, group, and manipulate .srt subtitle files.
 """
 
 import re
-from typing import List, Dict, Optional
+from typing import List, Dict
 
 
 def parse_srt(srt_text: str) -> List[Dict]:
