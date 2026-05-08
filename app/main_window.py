@@ -696,6 +696,7 @@ class MainWindow(QMainWindow):
             with open(srt_path, 'r', encoding='utf-8-sig') as f:
                 subs = parse_srt(f.read())
             self.subtitle_edit.load_subtitles(subs)
+            self.video_player.set_subtitle_entries(subs)
         except Exception as e:
             QMessageBox.warning(self, "Lỗi", f"Không đọc được SRT:\n{e}")
 
@@ -1027,6 +1028,16 @@ class MainWindow(QMainWindow):
             except Exception:
                 pass
 
+        # Persist each batch item to the SQLite render queue so a
+        # crash mid-batch leaves a recoverable trail.
+        self._enqueue_active_render(
+            video_path=video_path,
+            output_path=out,
+            config=self._batch_config,
+            subs=subs,
+            srt_path=srt_path or '',
+        )
+
         from app.threads.video_creator import VideoCreatorThread
         self.render_thread = VideoCreatorThread(
             video_path, out, self._batch_config, subs, self._batch_output_dir,
@@ -1051,6 +1062,7 @@ class MainWindow(QMainWindow):
             self._batch_index, percent)
 
     def _on_batch_item_done(self, path):
+        self._finalise_active_job(StageStatus.DONE)
         self.render_section.mark_batch_item_done(
             self._batch_index, ok=True)
         self.render_thread = None  # Cleanup before next
@@ -1058,6 +1070,7 @@ class MainWindow(QMainWindow):
         self._run_next_batch_item()
 
     def _on_batch_error(self, msg):
+        self._finalise_active_job(StageStatus.FAILED, error=msg)
         self.render_section.mark_batch_item_done(
             self._batch_index, ok=False,
             message=f"❌ Lỗi: {msg[:40]}" if msg else '❌ Lỗi')
@@ -1294,7 +1307,11 @@ class MainWindow(QMainWindow):
         self._current_project_path = path
         self._project_status.setText(f"Dự án: {Path(path).name}")
         if project.subtitles:
-            self.subtitle_edit.load_subtitles(list(project.subtitles))
+            subs = list(project.subtitles)
+            self.subtitle_edit.load_subtitles(subs)
+            self.video_player.set_subtitle_entries(subs)
+        if project.config:
+            self.config_section.apply_config(project.config)
         self.statusBar().showMessage(
             f"Đã mở dự án {project.name} ({len(project.jobs)} job)", 4000)
 

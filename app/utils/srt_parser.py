@@ -22,6 +22,10 @@ def parse_srt(srt_text: str) -> List[Dict]:
     }
     """
     entries = []
+    # Normalise BOM and mixed line-endings (\r\n, \r) so the regex
+    # split works reliably on Windows-edited SRT files.
+    srt_text = srt_text.lstrip('\ufeff')
+    srt_text = srt_text.replace('\r\n', '\n').replace('\r', '\n')
     blocks = re.split(r'\n\s*\n', srt_text.strip())
     
     for block in blocks:

@@ -638,7 +638,8 @@ class ConfigSection(QWidget):
             'zoom_enabled': self.chk_zoom.isChecked(),
             'flip_horizontal': self.chk_flip.isChecked(),
             'orig_volume': self.orig_volume.value(),
-            'theme': prefs.get('theme', 'dark'),
+            'theme': THEMES[min(self.combo_theme.currentIndex(),
+                                  len(THEMES) - 1)],
             'voice_per_provider': per_provider,
             'output_folder': prefs.get('output_folder', ''),
         })
@@ -744,6 +745,118 @@ class ConfigSection(QWidget):
     def get_selected_style(self): return self.combo_style.currentText()
     def get_source_lang(self): return self.combo_src_lang.currentData()
     def get_target_lang(self): return self.combo_tgt_lang.currentData()
+
+    def apply_config(self, config: dict) -> None:
+        """Push a config dict (from a .rpp project) back into the UI widgets.
+
+        This is the inverse of :meth:`get_config` — every key written by
+        ``get_config`` is restored here so opening a project faithfully
+        reproduces the saved editor state.
+        """
+        if not config:
+            return
+        try:
+            self.chk_subtitle_enabled.setChecked(
+                config.get('text_subtitle_enabled', True))
+            self.subtitle_size.setValue(
+                int(config.get('text_subtitle_size', self.subtitle_size.value())))
+            self._set_button_color(
+                self.btn_subtitle_color,
+                config.get('text_subtitle_color', '#ffffff'))
+            self.chk_subtitle_bg.setChecked(
+                config.get('text_subtitle_bg_enabled', False))
+            self._set_button_color(
+                self.btn_subtitle_bg_color,
+                config.get('text_subtitle_bg_color', '#000000'))
+            self.subtitle_bg_opacity.setValue(
+                int(config.get('text_subtitle_bg_opacity',
+                               self.subtitle_bg_opacity.value())))
+            self.subtitle_y.setValue(
+                int(config.get('text_subtitle_y', self.subtitle_y.value())))
+            self.subtitle_opacity.setValue(
+                int(config.get('text_subtitle_opacity',
+                               self.subtitle_opacity.value())))
+            audio_mode = config.get('audio_mode')
+            if audio_mode is not None:
+                btn = self.audio_group.button(int(audio_mode))
+                if btn:
+                    btn.setChecked(True)
+            self.orig_volume.setValue(
+                int(config.get('orig_volume', self.orig_volume.value())))
+            self.chk_bg_music.setChecked(
+                config.get('bg_music_enabled', False))
+            self.bg_music_path.setText(
+                config.get('bg_music_path', ''))
+            self.bg_music_volume.setValue(
+                int(config.get('bg_music_volume',
+                               self.bg_music_volume.value())))
+            self.chk_voice_file.setChecked(
+                config.get('voice_file_enabled', False))
+            self.voice_file_path.setText(
+                config.get('voice_file_path', ''))
+            self.chk_top_border.setChecked(
+                config.get('top_border_enabled', False))
+            self._set_button_color(
+                self.btn_top_color,
+                config.get('top_border_color', '#ffff00'))
+            self.top_text.setText(
+                config.get('top_border_text', ''))
+            self._set_button_color(
+                self.btn_top_text_color,
+                config.get('top_text_color', '#000000'))
+            self.top_height.setValue(
+                int(config.get('top_border_height', self.top_height.value())))
+            self.chk_bot_border.setChecked(
+                config.get('bot_border_enabled', False))
+            self._set_button_color(
+                self.btn_bot_color,
+                config.get('bot_border_color', '#000000'))
+            self.bot_text.setText(
+                config.get('bot_border_text', ''))
+            self._set_button_color(
+                self.btn_bot_text_color,
+                config.get('bot_text_color', '#ffffff'))
+            self.bot_height.setValue(
+                int(config.get('bot_border_height', self.bot_height.value())))
+            self.logo_path.setText(
+                config.get('logo_path', ''))
+            self.chk_zoom.setChecked(
+                config.get('zoom_enabled', False))
+            self.chk_flip.setChecked(
+                config.get('flip_horizontal', False))
+            self.chk_dynamic_zoom.setChecked(
+                config.get('dynamic_zoom_enabled', False))
+            self.zoom_value.setValue(
+                int(config.get('zoom_value', self.zoom_value.value())))
+            self.zoom_interval.setValue(
+                int(config.get('zoom_interval', self.zoom_interval.value())))
+            line_mode = config.get('line_mode')
+            if line_mode is not None:
+                btn = self.line_group.button(int(line_mode))
+                if btn:
+                    btn.setChecked(True)
+            self.voice_speed.setValue(
+                int(config.get('voice_speed_input', self.voice_speed.value())))
+            self.chk_1080p.setChecked(
+                config.get('resolution_1080p', False))
+            self.chk_4k.setChecked(
+                config.get('resolution_4k', False))
+            gpu = config.get('gpu_device', '')
+            if gpu:
+                idx = self.combo_gpu.findText(gpu)
+                if idx >= 0:
+                    self.combo_gpu.setCurrentIndex(idx)
+            self.chk_shutdown.setChecked(
+                config.get('auto_shutdown', False))
+        except Exception as exc:  # noqa: BLE001
+            logger.warning('apply_config partial failure: %s', exc)
+        self._schedule_preview()
+
+    @staticmethod
+    def _set_button_color(btn, color_str: str) -> None:
+        """Set a color-picker button's background to *color_str*."""
+        btn.setStyleSheet(
+            f'background-color: {color_str}; border: 1px solid #666;')
 
     # ── P3-9 Tooltips ──────────────────────────────────────────
     def _install_tooltips(self) -> None:
