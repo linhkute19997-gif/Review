@@ -120,17 +120,25 @@ def _migrate(payload: Dict[str, Any]) -> Dict[str, Any]:
 
 
 def _subtitles_to_srt(subtitles: Iterable[Dict[str, Any]]) -> str:
-    """Render the subtitle table back into SRT for the convenience copy."""
+    """Render the subtitle table back into SRT for the convenience copy.
+
+    Prefers the translated text when available so the user gets a
+    convenience copy that matches what they see in the editor — falls
+    back to the original ``text`` for untranslated rows.
+    """
     out = io.StringIO()
     for idx, sub in enumerate(subtitles, start=1):
         start = sub.get('start') or sub.get('start_time') or '00:00:00,000'
         end = sub.get('end') or sub.get('end_time') or '00:00:00,000'
-        text_lines: List[str] = []
-        text = sub.get('translated') or sub.get('text') or ''
-        if isinstance(text, list):
-            text_lines = [str(t) for t in text]
-        else:
-            text_lines = [str(text)]
+        # ``parse_srt`` writes ``translated_text``; older callers used
+        # the bare ``translated`` key — accept both for safety.
+        translated = sub.get('translated_text') or sub.get('translated')
+        original = sub.get('text') or ''
+        text = translated if (translated and str(translated).strip()) else original
+        text_lines: List[str] = (
+            [str(t) for t in text] if isinstance(text, list)
+            else [str(text)]
+        )
         out.write(f'{idx}\n{start} --> {end}\n')
         out.write('\n'.join(text_lines))
         out.write('\n\n')

@@ -236,7 +236,7 @@ class VoiceOverThread(QThread):
                 # (the previous frame_rate hack pitched voices like a
                 # chipmunk).
                 if self.speech_rate != 100 and os.path.exists(out_path):
-                    self._apply_atempo_inplace(
+                    self._apply_atempo_inplace_mp3(
                         out_path, self.speech_rate / 100.0)
 
                 if os.path.exists(out_path):
@@ -249,6 +249,47 @@ class VoiceOverThread(QThread):
                 logger.debug("Google TTS error for segment %s: %s", i, e)
 
         return segments
+
+    def _apply_atempo_inplace_mp3(self, src_path, factor):
+        """Apply FFmpeg ``atempo`` to ``src_path`` and overwrite it.
+
+        ``_apply_atempo_to_wav`` produces a separate WAV intermediate
+        for the merge path; this in-place variant keeps the file as
+        MP3 so the rest of ``_generate_google_tts`` does not need to
+        learn about a new path. Failures are logged and the original
+        file is left untouched (caller continues with unmodified MP3).
+        """
+        chain = _atempo_chain(factor)
+        if not chain:
+            return
+        ffmpeg = _ffmpeg_executable()
+        tmp_path = src_path + '.tmp.mp3'
+        cmd = [
+            ffmpeg, '-y', '-loglevel', 'error', '-i', src_path,
+            '-filter:a', chain,
+            '-c:a', 'libmp3lame', '-q:a', '4', tmp_path,
+        ]
+        try:
+            subprocess.run(
+                cmd, check=True,
+                creationflags=getattr(subprocess, 'CREATE_NO_WINDOW', 0))
+        except Exception as exc:
+            logger.debug("atempo in-place failed for %s: %s", src_path, exc)
+            if os.path.exists(tmp_path):
+                try:
+                    os.remove(tmp_path)
+                except OSError:
+                    pass
+            return
+        try:
+            shutil.move(tmp_path, src_path)
+        except OSError as exc:
+            logger.debug("atempo move failed for %s: %s", src_path, exc)
+            if os.path.exists(tmp_path):
+                try:
+                    os.remove(tmp_path)
+                except OSError:
+                    pass
 
     def _apply_atempo_to_wav(self, src_path, factor):
         """Apply FFmpeg ``atempo`` and write a 16-bit PCM WAV next to src.
