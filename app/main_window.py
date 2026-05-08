@@ -2,6 +2,8 @@
 Main Window — Central orchestrator for the application.
 """
 import os
+import platform
+import subprocess
 import sys
 from pathlib import Path
 from PyQt6.QtWidgets import (
@@ -17,7 +19,8 @@ from app.config_section import ConfigSection
 from app.subtitle_edit import SubtitleEditSection
 from app.render_section import RenderSection
 from app.utils.config import (
-    BASE_DIR, UI_TRANSLATIONS, load_api_config,
+    BASE_DIR, load_api_config,
+    load_user_preferences, save_user_preferences,
     LANGUAGES, TRANSLATION_MODELS
 )
 from app.utils.srt_parser import parse_srt
@@ -104,16 +107,15 @@ class MainWindow(QMainWindow):
         test_action = QAction("Test cấu hình", self)
         test_action.triggered.connect(self._test_encoders)
         system_menu.addAction(test_action)
+
+        out_action = QAction("📁 Thư mục lưu", self)
+        out_action.triggered.connect(self._open_output_folder_dialog)
+        system_menu.addAction(out_action)
         self.menus = {'system': system_menu}
 
-        # Language menu
-        lang_menu = menubar.addMenu("Ngôn Ngữ")
-        action_vi = QAction("Tiếng Việt", self)
-        action_vi.triggered.connect(lambda: self.switch_ui_language('vi'))
-        lang_menu.addAction(action_vi)
-        action_en = QAction("Tiếng Anh", self)
-        action_en.triggered.connect(lambda: self.switch_ui_language('en'))
-        lang_menu.addAction(action_en)
+        # i18n is intentionally not exposed: only ~3 strings are translated,
+        # so a switch action would mislead users. Implement full coverage
+        # before re-adding a language menu.
 
         # Tools menu
         tools_menu = menubar.addMenu("Công Cụ")
@@ -380,8 +382,7 @@ class MainWindow(QMainWindow):
         config = self.config_section.get_config()
         overlays = self._collect_overlay_data()
         base_name = Path(video_path).stem
-        output_dir = str(BASE_DIR / 'output')
-        os.makedirs(output_dir, exist_ok=True)
+        output_dir = self._resolve_output_dir()
         output_video = os.path.join(output_dir, f"{base_name}_output.mp4")
 
         # Disable button
@@ -419,7 +420,7 @@ class MainWindow(QMainWindow):
         QMessageBox.information(self, "Hoàn Thành", f"Video đã được tạo:\n{path}")
         # Auto shutdown if configured
         if self.config_section.get_config().get('auto_shutdown'):
-            os.system('shutdown /s /t 60')
+            self._schedule_shutdown(delay_seconds=60)
 
     def _save_translated_srt(self):
         """Save translated subtitles to SRT file."""
@@ -447,13 +448,54 @@ class MainWindow(QMainWindow):
     # ═══════════════════════════════════════════════════════
     # Menu actions
     # ═══════════════════════════════════════════════════════
-    def switch_ui_language(self, lang):
-        self._lang = lang
-        t = UI_TRANSLATIONS.get(lang, UI_TRANSLATIONS['vi'])
-        self.setWindowTitle(f"Review Phim Pro | V1.0.0 [{lang.upper()}]")
-        self.config_section.translate_status.setText(t.get('ready', 'Sẵn Sàng Dịch'))
-        self.config_section.btn_translate.setText(t.get('btn_start_translate', '▶ Tiến Hành Dịch Phụ Đề'))
-        self.btn_start_video.setText(t.get('btn_start_video', '▶ BẮT ĐẦU TẠO VIDEO'))
+    def _schedule_shutdown(self, delay_seconds=60):
+        """Schedule a system shutdown using the platform's native command.
+
+        ``os.system('shutdown /s /t 60')`` only works on Windows; on Linux
+        and macOS it silently fails (or prints a stray error). We dispatch
+        on ``sys.platform`` and gracefully report errors back to the user.
+        """
+        try:
+            if sys.platform.startswith('win'):
+                cmd = ['shutdown', '/s', '/t', str(int(delay_seconds))]
+            elif sys.platform == 'darwin':
+                # macOS: shutdown -h +<minutes>
+                minutes = max(1, int(round(delay_seconds / 60)))
+                cmd = ['sudo', 'shutdown', '-h', f'+{minutes}']
+            else:
+                # Linux / *nix: shutdown -h +<minutes>
+                minutes = max(1, int(round(delay_seconds / 60)))
+                cmd = ['shutdown', '-h', f'+{minutes}']
+            subprocess.Popen(cmd)
+        except Exception as exc:  # noqa: BLE001
+            QMessageBox.warning(
+                self, "Auto Shutdown",
+                f"Không thể lên lịch tắt máy ({platform.system()}): {exc}")
+
+    def _open_output_folder_dialog(self):
+        """Open dialog to set persistent output folder for renders."""
+        from app.dialogs import OutputFolderDialog
+        prefs = load_user_preferences()
+        current = prefs.get('output_folder', '') or str(BASE_DIR / 'output')
+        dialog = OutputFolderDialog(current, self)
+        if dialog.exec():
+            new_path = dialog.path_input.text().strip()
+            if new_path:
+                prefs['output_folder'] = new_path
+                save_user_preferences(prefs)
+                try:
+                    os.makedirs(new_path, exist_ok=True)
+                except OSError as exc:
+                    QMessageBox.warning(
+                        self, "Lỗi",
+                        f"Không thể tạo thư mục {new_path}: {exc}")
+
+    def _resolve_output_dir(self):
+        """Return the user-configured output dir, falling back to BASE_DIR/output."""
+        prefs = load_user_preferences()
+        out_dir = prefs.get('output_folder', '') or str(BASE_DIR / 'output')
+        os.makedirs(out_dir, exist_ok=True)
+        return out_dir
 
     def _show_system_info(self):
         from app.utils.encoder_detector import EncoderDetector
@@ -691,8 +733,7 @@ class MainWindow(QMainWindow):
             return
 
         config = self.config_section.get_config()
-        output_dir = str(BASE_DIR / 'output')
-        os.makedirs(output_dir, exist_ok=True)
+        output_dir = self._resolve_output_dir()
 
         # Add all to render table
         all_items = pairs + [(v, None) for v in unmatched]

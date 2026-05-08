@@ -6,11 +6,31 @@ import sys
 from pathlib import Path
 from PyQt6.QtWidgets import (
     QWidget, QVBoxLayout, QHBoxLayout, QLabel, QPushButton, QLineEdit,
-    QComboBox, QFileDialog, QTabWidget, QProgressBar, QListWidget,
-    QMessageBox, QDialog, QSizePolicy
+    QComboBox, QFileDialog, QTabWidget, QProgressBar,
+    QMessageBox, QDialog, QDoubleSpinBox
 )
-from PyQt6.QtCore import QThread, pyqtSignal, Qt
+from PyQt6.QtCore import QThread, pyqtSignal
 from app.utils.config import WHISPER_MODEL_OPTIONS, BASE_DIR
+
+# Module-level caches — Whisper and PaddleOCR each take ~30–60s to
+# load from disk; without these every extract reloaded them.
+_WHISPER_CACHE = {}
+_OCR_CACHE = {}
+
+
+def _get_whisper_model(model_name, device):
+    key = (model_name, device)
+    if key not in _WHISPER_CACHE:
+        import whisper  # local import — may need install on first run
+        _WHISPER_CACHE[key] = whisper.load_model(model_name, device=device)
+    return _WHISPER_CACHE[key]
+
+
+def _get_paddle_ocr(lang):
+    if lang not in _OCR_CACHE:
+        from paddleocr import PaddleOCR
+        _OCR_CACHE[lang] = PaddleOCR(use_angle_cls=True, lang=lang)
+    return _OCR_CACHE[lang]
 
 # PaddleOCR language codes — see
 # https://www.paddlepaddle.org.cn/paddle/paddleocr for the full set.
@@ -71,13 +91,19 @@ class SubtitleExtractThread(QThread):
     error = pyqtSignal(str)
 
     def __init__(self, video_files, use_audio=True, lang_code='vi',
-                 whisper_model_name='base', ocr_lang='ch'):
+                 whisper_model_name='base', ocr_lang='ch',
+                 ocr_y_top=0.7, ocr_y_bot=1.0):
         super().__init__()
         self.video_files = video_files
         self.use_audio = use_audio
         self.lang_code = lang_code
         self.whisper_model_name = whisper_model_name
         self.ocr_lang = ocr_lang
+        # Vertical band of the frame to scan (0.0 = top, 1.0 = bottom).
+        # Default scans the bottom 30% where subtitles usually appear.
+        self.ocr_y_top = max(0.0, min(1.0, float(ocr_y_top)))
+        self.ocr_y_bot = max(self.ocr_y_top + 0.05,
+                             min(1.0, float(ocr_y_bot)))
         self.device = self._detect_device()
 
     def _detect_device(self):
@@ -110,17 +136,15 @@ class SubtitleExtractThread(QThread):
 
     def _extract_from_audio(self, video_path):
         """Extract subtitles from audio using Whisper."""
+        self.progress.emit(f"Tải model {self.whisper_model_name}...")
         try:
-            import whisper
+            model = _get_whisper_model(self.whisper_model_name, self.device)
         except ImportError:
             import subprocess
             self.progress.emit("Đang cài đặt Whisper...")
             subprocess.run([sys.executable, '-m', 'pip', 'install', 'openai-whisper'],
                           creationflags=getattr(subprocess, 'CREATE_NO_WINDOW', 0))
-            import whisper
-
-        self.progress.emit(f"Tải model {self.whisper_model_name}...")
-        model = whisper.load_model(self.whisper_model_name, device=self.device)
+            model = _get_whisper_model(self.whisper_model_name, self.device)
 
         self.progress.emit("Đang nhận diện giọng nói...")
         result = model.transcribe(str(video_path), language=self.lang_code)
@@ -136,10 +160,15 @@ class SubtitleExtractThread(QThread):
         return '\n'.join(srt_lines)
 
     def _extract_from_ocr(self, video_path):
-        """Extract subtitles from video using PaddleOCR."""
+        """Extract subtitles from video using PaddleOCR.
+
+        Only the configured vertical band (default = bottom 30%) is
+        scanned, which both speeds up OCR and reduces false positives
+        from on-screen non-subtitle text.
+        """
         try:
             import cv2
-            from paddleocr import PaddleOCR
+            ocr = _get_paddle_ocr(self.ocr_lang)
         except ImportError:
             import subprocess
             self.progress.emit("Đang cài đặt OCR...")
@@ -147,12 +176,9 @@ class SubtitleExtractThread(QThread):
                           'opencv-python', 'paddleocr', 'paddlepaddle'],
                           creationflags=getattr(subprocess, 'CREATE_NO_WINDOW', 0))
             import cv2
-            from paddleocr import PaddleOCR
-
-        ocr = PaddleOCR(use_angle_cls=True, lang=self.ocr_lang)
+            ocr = _get_paddle_ocr(self.ocr_lang)
         cap = cv2.VideoCapture(str(video_path))
         fps = cap.get(cv2.CAP_PROP_FPS) or 25
-        total_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
         sample_interval = max(1, int(fps))  # 1 frame/second
 
         srt_entries = []
@@ -164,7 +190,12 @@ class SubtitleExtractThread(QThread):
             if not ret:
                 break
             if frame_idx % sample_interval == 0:
-                result = ocr.ocr(frame, cls=True)
+                # Crop to the configured band before OCR.
+                h = frame.shape[0]
+                y0 = int(h * self.ocr_y_top)
+                y1 = int(h * self.ocr_y_bot)
+                crop = frame[y0:y1, :] if y1 > y0 else frame
+                result = ocr.ocr(crop, cls=True)
                 if result and result[0]:
                     texts = [line[1][0] for line in result[0] if line[1][1] > 0.7]
                     text = ' '.join(texts)
@@ -304,6 +335,25 @@ class SubtitleExtractPage(QDialog):
         row_lang.addWidget(self.combo_ocr_lang)
         layout.addLayout(row_lang)
 
+        # Vertical scan band — only OCR a slice of each frame to skip
+        # logos / watermarks and run faster.
+        row_band = QHBoxLayout()
+        row_band.addWidget(QLabel("Vùng quét (% chiều cao):"))
+        self.ocr_y_top = QDoubleSpinBox()
+        self.ocr_y_top.setRange(0.0, 0.95)
+        self.ocr_y_top.setSingleStep(0.05)
+        self.ocr_y_top.setDecimals(2)
+        self.ocr_y_top.setValue(0.70)
+        row_band.addWidget(self.ocr_y_top)
+        row_band.addWidget(QLabel("→"))
+        self.ocr_y_bot = QDoubleSpinBox()
+        self.ocr_y_bot.setRange(0.05, 1.0)
+        self.ocr_y_bot.setSingleStep(0.05)
+        self.ocr_y_bot.setDecimals(2)
+        self.ocr_y_bot.setValue(1.00)
+        row_band.addWidget(self.ocr_y_bot)
+        layout.addLayout(row_band)
+
         row2 = QHBoxLayout()
         row2.addWidget(QLabel("Lưu tại:"))
         self.ocr_output = QLineEdit(str(BASE_DIR / 'output'))
@@ -374,8 +424,11 @@ class SubtitleExtractPage(QDialog):
         self.progress_bar.show()
 
         ocr_lang = self.combo_ocr_lang.currentData() or 'en'
+        y_top = self.ocr_y_top.value()
+        y_bot = self.ocr_y_bot.value()
         self.extract_thread = SubtitleExtractThread(
-            [video], use_audio=False, ocr_lang=ocr_lang)
+            [video], use_audio=False, ocr_lang=ocr_lang,
+            ocr_y_top=y_top, ocr_y_bot=y_bot)
         self.extract_thread.progress.connect(lambda msg: self.progress_label.setText(msg))
         self.extract_thread.finished.connect(self._on_extract_finished)
         self.extract_thread.error.connect(lambda msg: QMessageBox.warning(self, "Lỗi", msg))
