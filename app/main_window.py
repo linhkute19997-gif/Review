@@ -30,7 +30,15 @@ from app.utils.config import (
     BASE_DIR, load_api_config,
     load_user_preferences, save_user_preferences,
 )
-from app.utils.logger import get_logger
+from app.utils.logger import (
+    LOG_DIR,
+    clear_old_logs,
+    collect_system_info,
+    export_debug_bundle,
+    get_logger,
+    is_debug_enabled,
+    set_debug,
+)
 from app.utils.srt_parser import parse_srt
 
 logger = get_logger('main_window')
@@ -215,6 +223,33 @@ class MainWindow(QMainWindow):
         prewarm_action = QAction("🔥 Nạp trước Whisper / OCR", self)
         prewarm_action.triggered.connect(self._trigger_prewarm)
         tools_menu.addAction(prewarm_action)
+
+        # Debug menu — log-level toggle + bundle export so end users
+        # can ship us a usable trace when they hit a bug.
+        debug_menu = menubar.addMenu("🐞 Debug")
+        self._debug_toggle_action = QAction("Bật log Debug chi tiết", self)
+        self._debug_toggle_action.setCheckable(True)
+        self._debug_toggle_action.setChecked(is_debug_enabled())
+        self._debug_toggle_action.toggled.connect(self._on_toggle_debug)
+        debug_menu.addAction(self._debug_toggle_action)
+
+        debug_menu.addSeparator()
+        open_log_action = QAction("📁 Mở thư mục Log", self)
+        open_log_action.triggered.connect(self._open_log_folder)
+        debug_menu.addAction(open_log_action)
+
+        export_bundle_action = QAction("📦 Xuất Debug Bundle (.zip)…", self)
+        export_bundle_action.triggered.connect(self._export_debug_bundle)
+        debug_menu.addAction(export_bundle_action)
+
+        sysinfo_action = QAction("📋 Sao chép thông tin hệ thống", self)
+        sysinfo_action.triggered.connect(self._copy_system_info)
+        debug_menu.addAction(sysinfo_action)
+
+        debug_menu.addSeparator()
+        clear_logs_action = QAction("🧹 Xóa Log cũ (rotated)", self)
+        clear_logs_action.triggered.connect(self._clear_old_logs)
+        debug_menu.addAction(clear_logs_action)
 
     # ═══════════════════════════════════════════════════════
     # Main UI
@@ -672,6 +707,89 @@ class MainWindow(QMainWindow):
         for enc in available:
             msg += f"  ✓ {enc['description']}\n"
         QMessageBox.information(self, "Test Encoder", msg)
+
+    # ── Debug menu handlers ──────────────────────────────────────
+    # Wired in :meth:`_build_menu`; kept together here so the entire
+    # debug-logging surface lives in one screenful.
+
+    def _on_toggle_debug(self, checked: bool):
+        """Persist + apply the debug-logging toggle.
+
+        The flag drives the *console* handler level only — the rotating
+        file handler is always at DEBUG so ``logs/app.log`` keeps the
+        full trace regardless of this switch.
+        """
+        set_debug(checked)
+        prefs = load_user_preferences()
+        prefs['debug_logging'] = bool(checked)
+        save_user_preferences(prefs)
+        logger.info(
+            "User toggled debug logging via menu: %s",
+            'ON' if checked else 'off')
+
+    def _open_log_folder(self):
+        try:
+            LOG_DIR.mkdir(parents=True, exist_ok=True)
+        except OSError as exc:
+            QMessageBox.warning(
+                self, "Log", f"Không thể tạo thư mục log: {exc}")
+            return
+        target = str(LOG_DIR)
+        try:
+            if platform.system() == 'Windows':
+                os.startfile(target)  # type: ignore[attr-defined]
+            elif platform.system() == 'Darwin':
+                subprocess.run(['open', target], check=False)
+            else:
+                subprocess.run(['xdg-open', target], check=False)
+        except Exception as exc:  # noqa: BLE001
+            QMessageBox.warning(
+                self, "Log",
+                f"Không mở được thư mục log:\n{target}\n\n{exc}")
+
+    def _export_debug_bundle(self):
+        """Save logs + system info to a single zip the user can ship us."""
+        default_name = time.strftime('review-debug-%Y%m%d-%H%M%S.zip')
+        out_dir = self._resolve_output_dir()
+        suggested = str(Path(out_dir) / default_name)
+        path, _ = QFileDialog.getSaveFileName(
+            self, "Lưu Debug Bundle", suggested, "Zip (*.zip)")
+        if not path:
+            return
+        try:
+            written = export_debug_bundle(path)
+        except Exception as exc:  # noqa: BLE001
+            logger.exception("Failed to export debug bundle to %s", path)
+            QMessageBox.critical(
+                self, "Debug Bundle",
+                f"Không xuất được bundle:\n{exc}")
+            return
+        QMessageBox.information(
+            self, "Debug Bundle",
+            f"Đã lưu bundle tại:\n{written}\n\n"
+            "Gửi file này kèm mô tả lỗi để mình debug.")
+
+    def _copy_system_info(self):
+        """Drop system info into the clipboard for quick paste into chat."""
+        text = collect_system_info()
+        try:
+            from PyQt6.QtWidgets import QApplication
+            cb = QApplication.clipboard()
+            if cb is not None:
+                cb.setText(text)
+        except Exception:
+            pass
+        QMessageBox.information(
+            self, "Thông tin hệ thống",
+            "Đã copy thông tin hệ thống vào clipboard.\n"
+            "Bạn có thể paste vào chat / báo lỗi.")
+
+    def _clear_old_logs(self):
+        removed = clear_old_logs(keep_current=True)
+        QMessageBox.information(
+            self, "Log",
+            f"Đã xóa {removed} file log cũ (rotated)." if removed
+            else "Không có file log cũ để xóa.")
 
     def _open_api_config(self):
         from app.dialogs import APIConfigDialog

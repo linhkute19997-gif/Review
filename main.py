@@ -14,7 +14,13 @@ from PyQt6.QtGui import QFont
 from app.main_window import MainWindow
 from app.domain.prewarm import PrewarmService
 from app.utils.ffmpeg_check import check_ffmpeg
-from app.utils.logger import get_logger
+from app.utils.logger import (
+    enable_debug,
+    get_logger,
+    install_excepthooks,
+    log_boot_banner,
+)
+from app.utils.config import load_user_preferences
 from app.utils.theme import apply_theme
 
 logger = get_logger('main')
@@ -36,6 +42,16 @@ def _prewarm_encoders():
 
 
 def main():
+    # Wire excepthooks + boot banner BEFORE any heavy import / Qt
+    # construction so a crash during boot (e.g. a missing optional
+    # dependency surfaced via import) still lands in ``logs/app.log``
+    # instead of disappearing into a closed terminal window.
+    install_excepthooks()
+    prefs = load_user_preferences()
+    if bool(prefs.get('debug_logging', False)):
+        enable_debug()
+    log_boot_banner()
+
     app = QApplication(sys.argv)
     app.setFont(QFont("Segoe UI", 10))
     app.setStyle("Fusion")
